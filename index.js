@@ -57,11 +57,47 @@ const server = app.listen(PORT, async () => {
   console.log(`Estaciones globales disponibles: ${GLOBAL_STATIONS.length}`);
 });
 
-const wss = new WebSocketServer({ server, path: '/ws' });
+const wss = new WebSocketServer({ server, path: '/ws', clientTracking: true });
+
+// Ping/keepalive para evitar que el VPS o proxy corten la conexion por inactividad
+const PING_INTERVAL_MS = 20000;
+let pingTimer = null;
+
+function startPingTimer() {
+  if (pingTimer) return;
+  pingTimer = setInterval(() => {
+    for (const [clientId, client] of clients) {
+      const ws = client.ws;
+      if (ws.readyState === ws.OPEN) {
+        // Ping a nivel WS (control frame)
+        if (ws.isAlive === false) {
+          // No respondio al ping anterior, cerrar
+          ws.terminate();
+          continue;
+        }
+        ws.isAlive = false;
+        ws.ping();
+
+        // Heartbeat a nivel aplicacion (mensaje JSON)
+        // Esto asegura que el proxy no corte por inactividad de datos
+        try {
+          ws.send(JSON.stringify({ type: 'ping', timestamp: new Date().toISOString() }));
+        } catch (e) {
+          // ignore
+        }
+      } else if (ws.readyState === ws.CLOSED || ws.readyState === ws.CLOSING) {
+        clients.delete(clientId);
+        unsubscribeUser(clientId);
+      }
+    }
+  }, PING_INTERVAL_MS);
+}
+startPingTimer();
 
 wss.on('connection', (ws) => {
   const clientId = `client_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   ws.clientId = clientId;
+  ws.isAlive = true;
   clients.set(clientId, {
     ws,
     location: null,
@@ -78,9 +114,16 @@ wss.on('connection', (ws) => {
     clientId,
   }));
 
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
+      // Responder al pong del cliente para el heartbeat
+      if (msg.type === 'pong') {
+        ws.isAlive = true;
+        return;
+      }
       handleClientMessage(clientId, msg);
     } catch (e) {
       // ignore
