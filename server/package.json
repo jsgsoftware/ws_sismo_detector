@@ -1,0 +1,24 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "Servidor de alertas sismicas en tiempo real con EarthScope SeedLink",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node --import ./polyfill.mjs index.js"
+  },
+  "keywords": ["sismo", "earthquake", "seedlink", "earthscope", "alerta"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "seisplotjs": "^3.2.7",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/ws": "^8.18.1"
+  }
+}

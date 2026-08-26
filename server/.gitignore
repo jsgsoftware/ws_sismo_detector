@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# logs
+*.log
+*.log.*
+server-err.log
+server.log
+tunnel.log
+tunnel-err.log
+tunnel-url.txt
+stations.txt
+
+# temp / test
+test-*.mjs
+test-*.cjs
+run-*.cjs
+start-*.cjs
+kill-port.ps1
+
+# env
+.env*.local
