@@ -22,59 +22,93 @@ export let GLOBAL_STATIONS = [...FALLBACK_STATIONS];
 
 // Cargar estaciones dinamicamente desde el FDSN de IRIS
 // Usa curl porque el servidor IRIS envia headers HTTP malformados (Duplicate Content-Length)
-// que el parser HTTP de Node rechaza
+// que el parser HTTP de Node rechaza. Si curl falla, intenta con stations.txt local.
 export async function loadStationsFromFDSN() {
-  return new Promise((resolve) => {
-    const url = `${FDSN_STATION_URL}?format=text&level=station&channel=BHZ&starttime=2026-01-01&includerestricted=false`;
-    console.log(`[FDSN] Consultando estaciones desde IRIS...`);
+  // Primero intentar con curl (consulta en vivo)
+  const url = `${FDSN_STATION_URL}?format=text&level=station&channel=BHZ&starttime=2026-01-01&includerestricted=false`;
+  console.log(`[FDSN] Consultando estaciones desde IRIS...`);
 
+  const curlResult = await loadWithCurl(url);
+  if (curlResult) return;
+
+  // Si curl falla, usar archivo local stations.txt
+  console.log(`[FDSN] curl fallo, intentando archivo local stations.txt...`);
+  const fileResult = await loadFromFile('stations.txt');
+  if (fileResult) return;
+
+  // Ultimo recurso: fallback
+  console.warn(`[FDSN] Usando fallback (${FALLBACK_STATIONS.length} estaciones)`);
+}
+
+function parseStationsText(text) {
+  const lines = text.split('\n').filter((l) => l.trim() && !l.startsWith('#'));
+  const stations = [];
+  for (const line of lines) {
+    const parts = line.split('|');
+    if (parts.length < 5) continue;
+    const network = parts[0].trim();
+    const stationCode = parts[1].trim();
+    const lat = parseFloat(parts[2]);
+    const lon = parseFloat(parts[3]);
+    const siteName = parts[5] ? parts[5].trim() : `${network}-${stationCode}`;
+
+    if (!network || !stationCode || isNaN(lat) || isNaN(lon)) continue;
+
+    stations.push({
+      code: `${network}-${stationCode}`,
+      network,
+      station: stationCode,
+      name: siteName,
+      lat,
+      lon,
+    });
+  }
+  return stations;
+}
+
+function loadWithCurl(url) {
+  return new Promise((resolve) => {
     const curl = process.platform === 'win32' ? 'curl.exe' : 'curl';
     const child = execFile(
       curl,
       ['-sL', '--max-time', '60', '-H', 'Connection: close', url],
       { maxBuffer: 50 * 1024 * 1024, timeout: 70000 },
       (err, stdout) => {
-        if (err) {
-          console.warn(`[FDSN] Error cargando estaciones: ${err.message}`);
-          console.warn(`[FDSN] Usando fallback (${FALLBACK_STATIONS.length} estaciones)`);
-          return resolve();
+        if (err || !stdout) {
+          if (err) console.warn(`[FDSN] curl error: ${err.message}`);
+          return resolve(false);
         }
-        try {
-          const lines = stdout.split('\n').filter((l) => l.trim() && !l.startsWith('#'));
-          const stations = [];
-          for (const line of lines) {
-            const parts = line.split('|');
-            if (parts.length < 5) continue;
-            const network = parts[0].trim();
-            const stationCode = parts[1].trim();
-            const lat = parseFloat(parts[2]);
-            const lon = parseFloat(parts[3]);
-            const siteName = parts[5] ? parts[5].trim() : `${network}-${stationCode}`;
-
-            if (!network || !stationCode || isNaN(lat) || isNaN(lon)) continue;
-
-            stations.push({
-              code: `${network}-${stationCode}`,
-              network,
-              station: stationCode,
-              name: siteName,
-              lat,
-              lon,
-            });
-          }
-
-          if (stations.length > 0) {
-            GLOBAL_STATIONS = stations;
-            console.log(`[FDSN] ${stations.length} estaciones cargadas dinamicamente`);
-          } else {
-            console.warn(`[FDSN] Sin estaciones, usando fallback (${FALLBACK_STATIONS.length})`);
-          }
-        } catch (parseErr) {
-          console.warn(`[FDSN] Error procesando respuesta: ${parseErr.message}`);
+        const stations = parseStationsText(stdout);
+        if (stations.length > 0) {
+          GLOBAL_STATIONS = stations;
+          console.log(`[FDSN] ${stations.length} estaciones cargadas (curl)`);
+          resolve(true);
+        } else {
+          resolve(false);
         }
-        resolve();
       }
     );
+  });
+}
+
+function loadFromFile(path) {
+  return new Promise((resolve) => {
+    import('fs').then((fs) => {
+      fs.readFile(path, 'utf8', (err, data) => {
+        if (err) {
+          console.warn(`[FDSN] No se pudo leer ${path}: ${err.message}`);
+          return resolve(false);
+        }
+        const stations = parseStationsText(data);
+        if (stations.length > 0) {
+          GLOBAL_STATIONS = stations;
+          console.log(`[FDSN] ${stations.length} estaciones cargadas (${path})`);
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      });
+    });
   });
 }
 

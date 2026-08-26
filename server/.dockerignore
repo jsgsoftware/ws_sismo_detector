@@ -4,7 +4,6 @@ server-err.log
 tunnel.log
 tunnel-err.log
 tunnel-url.txt
-stations.txt
 *.ps1
 test-*.mjs
 test-*.cjs
