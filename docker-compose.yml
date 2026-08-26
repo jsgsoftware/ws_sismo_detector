@@ -1,6 +1,6 @@
 services:
   server:
-    build: ./server
+    build: .
     container_name: sismo-server
     ports:
       - "3001:3001"
