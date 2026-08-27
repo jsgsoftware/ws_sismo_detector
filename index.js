@@ -40,6 +40,21 @@ app.get('/status', (req, res) => {
   });
 });
 
+// Listar clientes conectados con su clientId y ubicacion
+app.get('/clients', (req, res) => {
+  const list = [];
+  for (const [clientId, client] of clients) {
+    list.push({
+      clientId,
+      location: client.location,
+      radiusKm: client.radiusKm,
+      stations: client.stations?.map((s) => s.code) || [],
+      connected: client.ws?.readyState === 1,  // OPEN
+    });
+  }
+  res.json({ total: list.length, clients: list });
+});
+
 app.get('/stations', (req, res) => {
   const { lat, lon, radius } = req.query;
   if (lat && lon) {
@@ -317,6 +332,251 @@ function broadcastToSubscribers(entry, message) {
       client.ws.send(data);
     }
   }
+}
+
+// =====================================================================
+//  SIMULADOR: inyecta un sismo sintetico en el pipeline
+//  Genera picks P escalonados en las estaciones suscritas, como si un
+//  sismo real hubiera sido detectado. Pasa por correlacion → localizacion → ML → alerta.
+// =====================================================================
+
+import { DateTime } from 'luxon';
+
+// GET /simulate?lat=LAT&lon=LON&mag=MAG&clientId=CLIENT_ID
+// Simula un sismo de magnitud MAG en (LAT, LON) detectado por las estaciones activas.
+// Si clientId se especifica, envia la alerta SOLO a ese cliente.
+// Si no, envia a todos los clientes conectados.
+app.get('/simulate', async (req, res) => {
+  try {
+    const lat = parseFloat(req.query.lat) || 9.04;
+    const lon = parseFloat(req.query.lon) || -79.42;
+    const mag = parseFloat(req.query.mag) || 4.5;
+    const targetClientId = req.query.clientId || null;
+
+    console.log(`[SIM] Simulando sismo M${mag} en lat=${lat} lon=${lon}${targetClientId ? ` para cliente ${targetClientId}` : ' (broadcast)'}`);
+
+    // Obtener estaciones activas del pool, o las mas cercanas si no hay
+    let stationsToUse = [];
+    const pool = getPoolStats();
+    if (pool.totalConnections > 0) {
+      // Usar estaciones activas del pool
+      for (const s of pool.stations) {
+        const stationInfo = GLOBAL_STATIONS.find((g) => g.code === s.code);
+        if (stationInfo) {
+          stationsToUse.push({
+            code: s.code,
+            name: s.name,
+            lat: stationInfo.lat,
+            lon: stationInfo.lon,
+          });
+        }
+      }
+    }
+
+    // Si no hay estaciones activas, usar las 3 mas cercanas al epicentro simulado
+    if (stationsToUse.length === 0) {
+      const nearby = findNearbyStations(lat, lon, 1000);
+      stationsToUse = nearby.map((s) => ({ code: s.code, name: s.name, lat: s.lat, lon: s.lon }));
+    }
+
+    if (stationsToUse.length === 0) {
+      return res.json({ ok: false, error: 'No hay estaciones disponibles' });
+    }
+
+    // Tomar las primeras 3 estaciones
+    const stations = stationsToUse.slice(0, 3);
+
+    // Calcular tiempo de llegada P a cada estacion (Vp = 6.1 km/s)
+    const { Vp, Vs } = SEISMIC_CONFIG.velocities;
+    const originTime = DateTime.utc();
+
+    // Para que la correlacion funcione (min 2 estaciones en 15s),
+    // comprimir los tiempos de llegada: usar solo el offset relativo entre estaciones
+    // sin esperar los 60s reales. Esto simula un sismo mas cercano.
+    const baseDistance = Math.min(...stations.map(s => haversineKm(s.lat, s.lon, lat, lon)));
+    const maxAllowedDelay = 12;  // segundos maximos entre la primera y ultima estacion
+
+    // Amplitud sintetica en m/s (aproximada para M4-M6 a 50-500 km)
+    // PGA ~ 10^(0.5*M - log10(R) - 0.9) en m/s^2, velocidad ~ PGA/omega
+    // Simplificado: amplitud pico en m/s
+    const picks = [];
+
+    for (const sta of stations) {
+      // Distancia estacion → epicentro
+      const distKm = haversineKm(sta.lat, sta.lon, lat, lon);
+      // Comprimir retardos para que todas las estaciones detecten dentro de la ventana de correlacion
+      // El offset relativo se preserva (estacion mas lejana detecta despues)
+      const relativeDelay = Math.min(maxAllowedDelay, (distKm - baseDistance) / Vp);
+      const pTravelTime = 2 + relativeDelay;  // 2s base + offset relativo
+      const pArrival = originTime.plus({ seconds: pTravelTime });
+
+      // Amplitud pico sintetica en m/s (decrece con distancia, crece con magnitud)
+      const peakVelocity = Math.pow(10, 0.5 * mag - Math.log10(distKm + 10) - 2.5);
+
+      picks.push({
+        stationCode: sta.code,
+        pTime: pArrival,
+        amplitude: peakVelocity,  // m/s
+        lat: sta.lat,
+        lon: sta.lon,
+        sampleRate: 40,
+        channel: 'BHZ',
+        distanceKm: distKm,
+      });
+
+      console.log(`[SIM] ${sta.code}: P en ${pTravelTime.toFixed(1)}s (${distKm.toFixed(0)}km) amp=${peakVelocity.toExponential(2)} m/s`);
+    }
+
+    // Enviar respuesta inmediata
+    res.json({
+      ok: true,
+      simulation: {
+        magnitude: mag,
+        latitude: lat,
+        longitude: lon,
+        originTime: originTime.toISO(),
+        stations: picks.map((p) => ({
+          code: p.stationCode,
+          distanceKm: p.distanceKm,
+          pArrivalSeconds: (p.pTime.toMillis() - originTime.toMillis()) / 1000,
+          peakVelocity: p.amplitude,
+        })),
+      },
+    });
+
+    // Inyectar picks P escalonados en el correlador
+    for (const pick of picks) {
+      const delayMs = pick.pTime.toMillis() - Date.now();
+      const delay = Math.max(0, delayMs);
+
+      setTimeout(() => {
+        console.log(`[SIM] Inyectando P pick en ${pick.stationCode}`);
+        const event = registerPPick(pick);
+
+        if (event && event.state === 'CONFIRMED_EVENT') {
+          console.log(`[SIM] Evento confirmado con ${event.numStations} estaciones`);
+          handleSimulatedEvent(event, lat, lon, mag, targetClientId);
+        } else if (event && event.state === 'POSSIBLE_EVENT') {
+          // Enviar possible_event a los clientes suscritos a esa estacion
+          broadcastPossibleEvent(pick.stationCode, targetClientId);
+        }
+      }, delay);
+    }
+
+    // Inyectar pick S despues (para la estacion mas cercana)
+    if (picks.length > 0) {
+      const closest = picks[0];
+      const sTravelTime = closest.distanceKm / Vs;
+      const sArrival = originTime.plus({ seconds: sTravelTime });
+      const sDelayMs = Math.max(0, sArrival.toMillis() - Date.now());
+
+      setTimeout(() => {
+        console.log(`[SIM] Inyectando S pick en ${closest.stationCode}`);
+        registerSPick(closest.stationCode, sArrival, closest.amplitude * 2);
+        broadcastSWave(closest.stationCode, sArrival, closest.amplitude * 2, targetClientId);
+      }, sDelayMs);
+    }
+  } catch (err) {
+    console.error('[SIM] Error:', err.message);
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// Procesar evento simulado confirmado
+function handleSimulatedEvent(event, epicenterLat, epicenterLon, mag, targetClientId) {
+  // Localizar epicentro (deberia aproximarse al lat/lon simulado)
+  const location = locateEpicenter(event.picks);
+
+  // Calcular magnitud ML
+  const picksWithVelocity = event.picks.map((p) => ({
+    ...p,
+    peakVelocityMs: p.amplitude,
+  }));
+  const magnitudeResult = calculateEventMagnitude(picksWithVelocity, location || {
+    latitude: epicenterLat,
+    longitude: epicenterLon,
+    depth: null,
+  });
+
+  // Construir alerta
+  const alert = {
+    type: 'earthquake_early_warning',
+    originTime: location?.originTime?.toISOString() || new Date().toISOString(),
+    latitude: location?.latitude ?? epicenterLat,
+    longitude: location?.longitude ?? epicenterLon,
+    depth: location?.depth ?? null,
+    magnitude: magnitudeResult?.magnitude ?? mag,
+    magnitudeType: magnitudeResult?.magnitudeType || 'ML',
+    stationMagnitudes: magnitudeResult?.stationMagnitudes || [],
+    stationsUsed: event.numStations,
+    pWaveDetected: true,
+    estimatedSArrivalSeconds: null,
+    confidence: location?.confidence ?? 0.5,
+    preliminaryLocation: location?.preliminaryLocation ?? true,
+    residual: location?.residual ?? null,
+    simulated: true,
+  };
+
+  // Enviar al cliente especifico o a todos
+  for (const [clientId, client] of clients) {
+    // Si se especifico un cliente, saltar los demas
+    if (targetClientId && clientId !== targetClientId) continue;
+    if (!client.location || client.ws.readyState !== client.ws.OPEN) continue;
+
+    const userLat = client.location.latitude;
+    const userLon = client.location.longitude;
+    const userAlert = { ...alert };
+
+    if (location) {
+      userAlert.distanceKm = epicentralDistanceKm(location.latitude, location.longitude, userLat, userLon);
+      userAlert.estimatedSArrivalSeconds = estimateSArrivalSeconds(location, userLat, userLon);
+    } else {
+      userAlert.distanceKm = epicentralDistanceKm(epicenterLat, epicenterLon, userLat, userLon);
+      userAlert.estimatedSArrivalSeconds = epicentralDistanceKm(epicenterLat, epicenterLon, userLat, userLon) / SEISMIC_CONFIG.velocities.Vs;
+    }
+
+    client.ws.send(JSON.stringify(userAlert));
+    console.log(`[SIM] Alerta enviada a ${clientId}`);
+  }
+
+  console.log(`[SIM] Alerta: M${alert.magnitude?.toFixed(1)} lat=${alert.latitude?.toFixed(2)} lon=${alert.longitude?.toFixed(2)} estaciones=${event.numStations}`);
+}
+
+// Enviar possible_event a un cliente especifico o a todos
+function broadcastPossibleEvent(stationCode, targetClientId) {
+  for (const [clientId, client] of clients) {
+    if (targetClientId && clientId !== targetClientId) continue;
+    if (client.ws.readyState !== client.ws.OPEN) continue;
+    client.ws.send(JSON.stringify({
+      type: 'possible_event',
+      station: stationCode,
+      pPickTime: new Date().toISOString(),
+      numStations: 1,
+    }));
+  }
+}
+
+// Enviar s_wave_detected a un cliente especifico o a todos
+function broadcastSWave(stationCode, sTime, amplitude, targetClientId) {
+  for (const [clientId, client] of clients) {
+    if (targetClientId && clientId !== targetClientId) continue;
+    if (client.ws.readyState !== client.ws.OPEN) continue;
+    client.ws.send(JSON.stringify({
+      type: 's_wave_detected',
+      station: stationCode,
+      sPickTime: sTime?.toISO?.() || sTime?.toISOString?.(),
+      amplitude,
+    }));
+  }
+}
+
+// Haversine para el simulador
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
 }
 
 console.log('Iniciando servidor de alertas sismicas con deteccion STA/LTA + multi-estacion');
