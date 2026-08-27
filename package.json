@@ -11,6 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@xmldom/xmldom": "^0.9.12",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "seisplotjs": "^3.2.7",
