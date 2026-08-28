@@ -24,6 +24,49 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const clients = new Map();
 
+// === Envio de push notifications via Expo Push Service ===
+async function sendExpoPush(pushToken, title, body, data = {}) {
+  try {
+    const message = {
+      to: pushToken,
+      title,
+      body,
+      data: { ...data, type: 'seismic_alert' },
+      sound: 'default',
+      priority: 'high',
+      channelId: 'sismo-alertas',
+    };
+    const resp = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(message),
+    });
+    const result = await resp.json();
+    console.log(`[PUSH] Enviado a ${pushToken.slice(0, 25)}...:`, result?.data?.status || result);
+  } catch (e) {
+    console.log('[PUSH] Error enviando push:', e.message);
+  }
+}
+
+// Enviar push a un cliente especifico (si tiene pushToken)
+function sendPushToClient(client, alert) {
+  if (!client.pushToken) return;
+  const mag = alert.magnitude != null ? `M${alert.magnitude.toFixed(1)}` : 'M?';
+  const dist = alert.distanceKm != null ? ` a ${alert.distanceKm.toFixed(0)}km` : '';
+  const sArrival = alert.estimatedSArrivalSeconds != null && alert.estimatedSArrivalSeconds > 0
+    ? ` - Onda S en ${Math.round(alert.estimatedSArrivalSeconds)}s`
+    : '';
+  sendExpoPush(
+    client.pushToken,
+    `ALERTA SISMICA ${mag}`,
+    `Sismo detectado${dist}${sArrival}`,
+    alert
+  );
+}
+
 // === Logging de eventos para calibracion ===
 const eventLog = [];
 
@@ -140,6 +183,10 @@ async function handleClientMessage(clientId, msg) {
   if (msg.type === 'subscribe' && msg.latitude != null && msg.longitude != null) {
     client.location = { latitude: msg.latitude, longitude: msg.longitude };
     client.radiusKm = msg.radiusKm || 500;
+    if (msg.pushToken) {
+      client.pushToken = msg.pushToken;
+      console.log(`[SUB] Push token registrado para ${clientId}: ${msg.pushToken.slice(0, 25)}...`);
+    }
 
     const stations = await subscribeUserToStations(
       clientId, msg.latitude, msg.longitude, client.radiusKm, onDataCallback, onAlertCallback
@@ -303,6 +350,18 @@ function handleConfirmedEvent(entry, event, broadcastFn) {
     }
 
     client.ws.send(JSON.stringify(userAlert));
+  }
+
+  // 4b. Enviar push notification a clientes con pushToken (incluso si WS cerrado)
+  for (const clientId of entry.subscribers) {
+    const client = clients.get(clientId);
+    if (!client || !client.location || !client.pushToken) continue;
+    let userAlert = { ...alert };
+    if (location) {
+      userAlert.distanceKm = epicentralDistanceKm(location.latitude, location.longitude, client.location.latitude, client.location.longitude);
+      userAlert.estimatedSArrivalSeconds = estimateSArrivalSeconds(location, client.location.latitude, client.location.longitude);
+    }
+    sendPushToClient(client, userAlert);
   }
 
   // 5. Log para calibracion
@@ -537,6 +596,21 @@ function handleSimulatedEvent(event, epicenterLat, epicenterLon, mag, targetClie
 
     client.ws.send(JSON.stringify(userAlert));
     console.log(`[SIM] Alerta enviada a ${clientId}`);
+  }
+
+  // Enviar push notification a clientes con pushToken (incluso si WS cerrado)
+  for (const [clientId, client] of clients) {
+    if (targetClientId && clientId !== targetClientId) continue;
+    if (!client.location || !client.pushToken) continue;
+    const userAlert = { ...alert };
+    if (location) {
+      userAlert.distanceKm = epicentralDistanceKm(location.latitude, location.longitude, client.location.latitude, client.location.longitude);
+      userAlert.estimatedSArrivalSeconds = estimateSArrivalSeconds(location, client.location.latitude, client.location.longitude);
+    } else {
+      userAlert.distanceKm = epicentralDistanceKm(epicenterLat, epicenterLon, client.location.latitude, client.location.longitude);
+      userAlert.estimatedSArrivalSeconds = userAlert.distanceKm / SEISMIC_CONFIG.velocities.Vs;
+    }
+    sendPushToClient(client, userAlert);
   }
 
   console.log(`[SIM] Alerta: M${alert.magnitude?.toFixed(1)} lat=${alert.latitude?.toFixed(2)} lon=${alert.longitude?.toFixed(2)} estaciones=${event.numStations}`);
