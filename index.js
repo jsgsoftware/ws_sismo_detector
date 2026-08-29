@@ -178,6 +178,8 @@ app.get('/clients', (req, res) => {
       radiusKm: client.radiusKm,
       stations: client.stations?.map((s) => s.code) || [],
       connected: client.ws?.readyState === 1,  // OPEN
+      hasPushToken: !!client.pushToken,
+      pushToken: client.pushToken ? client.pushToken.slice(0, 30) + '...' : null,
     });
   }
   res.json({ total: list.length, clients: list });
