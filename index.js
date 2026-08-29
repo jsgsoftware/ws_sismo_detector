@@ -51,7 +51,6 @@ async function sendExpoPush(pushToken, title, body, data = {}) {
   }
 }
 
-// Enviar push a un cliente especifico (si tiene pushToken)
 function sendPushToClient(client, alert) {
   if (!client.pushToken) return;
   const mag = alert.magnitude != null ? `M${alert.magnitude.toFixed(1)}` : 'M?';
@@ -69,6 +68,92 @@ function sendPushToClient(client, alert) {
 
 // === Logging de eventos para calibracion ===
 const eventLog = [];
+
+// === Store persistente de push tokens (sobrevive al cierre del WS) ===
+// Map<pushToken, { latitude, longitude, radiusKm, registeredAt }>
+const pushTokenStore = new Map();
+
+app.post('/register-push', (req, res) => {
+  const { pushToken, latitude, longitude, radiusKm } = req.body;
+  if (!pushToken || latitude == null || longitude == null) {
+    return res.status(400).json({ ok: false, error: 'pushToken, latitude y longitude requeridos' });
+  }
+  pushTokenStore.set(pushToken, {
+    latitude,
+    longitude,
+    radiusKm: radiusKm || 500,
+    registeredAt: Date.now(),
+  });
+  console.log(`[PUSH-REG] Token registrado via HTTP: ${pushToken.slice(0, 25)}... lat=${latitude} lon=${longitude} r=${radiusKm}km (total: ${pushTokenStore.size})`);
+  res.json({ ok: true });
+});
+
+app.post('/unregister-push', (req, res) => {
+  const { pushToken } = req.body;
+  if (!pushToken) {
+    return res.status(400).json({ ok: false, error: 'pushToken requerido' });
+  }
+  if (pushTokenStore.has(pushToken)) {
+    pushTokenStore.delete(pushToken);
+    console.log(`[PUSH-REG] Token eliminado: ${pushToken.slice(0, 25)}... (total: ${pushTokenStore.size})`);
+  }
+  res.json({ ok: true });
+});
+
+app.get('/push-tokens', (req, res) => {
+  const list = [];
+  for (const [token, info] of pushTokenStore) {
+    list.push({
+      token: token.slice(0, 25) + '...',
+      latitude: info.latitude,
+      longitude: info.longitude,
+      radiusKm: info.radiusKm,
+      registeredAt: new Date(info.registeredAt).toISOString(),
+    });
+  }
+  res.json({ total: list.length, tokens: list });
+});
+
+// Enviar push a todos los tokens registrados dentro del rango del evento
+function sendPushToAllTokens(alert) {
+  const { latitude, longitude, magnitude } = alert;
+  if (latitude == null || longitude == null) return;
+
+  for (const [token, info] of pushTokenStore) {
+    // Calcular distancia del epicentro a la ubicacion registrada del token
+    const dist = haversineKm(latitude, longitude, info.latitude, info.longitude);
+    if (dist > info.radiusKm) continue;
+
+    const userAlert = { ...alert, distanceKm: dist };
+
+    const mag = magnitude != null ? `M${magnitude.toFixed(1)}` : 'M?';
+    const distText = ` a ${dist.toFixed(0)}km`;
+    const sArrival = userAlert.estimatedSArrivalSeconds != null && userAlert.estimatedSArrivalSeconds > 0
+      ? ` - Onda S en ${Math.round(userAlert.estimatedSArrivalSeconds)}s`
+      : '';
+
+    // Calcular tiempo de llegada S para este usuario
+    if (alert.latitude != null && alert.longitude != null) {
+      userAlert.estimatedSArrivalSeconds = dist / SEISMIC_CONFIG.velocities.Vs;
+    }
+
+    sendExpoPush(
+      token,
+      `ALERTA SISMICA ${mag}`,
+      `Sismo detectado${distText}${sArrival}`,
+      userAlert
+    );
+  }
+}
+
+// Haversine para push
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', clients: clients.size, pool: getPoolStats() });
@@ -364,6 +449,9 @@ function handleConfirmedEvent(entry, event, broadcastFn) {
     sendPushToClient(client, userAlert);
   }
 
+  // 4b. Enviar push a todos los tokens registrados via HTTP (app cerrada)
+  sendPushToAllTokens(alert);
+
   // 5. Log para calibracion
   const logEntry = {
     timestamp: new Date().toISOString(),
@@ -613,6 +701,9 @@ function handleSimulatedEvent(event, epicenterLat, epicenterLon, mag, targetClie
     sendPushToClient(client, userAlert);
   }
 
+  // Enviar push a tokens registrados via HTTP (app cerrada)
+  sendPushToAllTokens(alert);
+
   console.log(`[SIM] Alerta: M${alert.magnitude?.toFixed(1)} lat=${alert.latitude?.toFixed(2)} lon=${alert.longitude?.toFixed(2)} estaciones=${event.numStations}`);
 }
 
@@ -644,13 +735,4 @@ function broadcastSWave(stationCode, sTime, amplitude, targetClientId) {
   }
 }
 
-// Haversine para el simulador
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
-
-console.log('Iniciando servidor de alertas sismicas con deteccion STA/LTA + multi-estacion');
+console.log('Iniciando servidor de alertas sismicas con deteccion STA/LTA + multi-estacion + push');
