@@ -192,20 +192,26 @@ async function setupStation(entry, onDataCallback, onAlertCallback) {
 // Conectar a un canal especifico via SeedLink
 function connectToStationChannel(entry, channelInfo, onDataCallback, onAlertCallback) {
   const { station } = entry;
+  // SeedLink v3 usa el formato LLSSS.T para los selectores:
+  // ubicación + canal + tipo. No lleva un punto entre ubicación y canal.
+  // Para una ubicación vacía, "--" representa los dos espacios del código.
+  const location = (channelInfo.location || '--').padEnd(2, ' ').slice(0, 2).replace(/ /g, '-');
   const commands = [
     `STATION ${station.network} ${station.station}`,
-    `SELECT ${channelInfo.location}.${channelInfo.channel}.D`,
+    `SELECT ${location}${channelInfo.channel}.D`,
   ];
 
   console.log(`[POOL] Conectando a ${station.code} canal ${channelInfo.channel} (${channelInfo.component})`);
 
   try {
     const startTime = DateTime.utc().minus({ seconds: 30 });
+    let connectionFailed = false;
     const slConn = new seedlink.SeedlinkConnection(SEEDLINK_URL, commands,
       (packet) => {
         handleMiniseedPacket(entry, channelInfo, packet, onDataCallback, onAlertCallback);
       },
       (error) => {
+        connectionFailed = true;
         console.error(`[POOL] Error ${station.code}/${channelInfo.channel}:`, error.message);
         entry.connected = false;
         scheduleReconnect(entry, channelInfo, onDataCallback, onAlertCallback);
@@ -218,6 +224,9 @@ function connectToStationChannel(entry, channelInfo, onDataCallback, onAlertCall
     });
     slConn.setTimeCommand(startTime);
     slConn.connect().then(() => {
+      // seisplotjs llama al errorHandler y luego resuelve connect() con undefined
+      // cuando falla un comando SeedLink; no tratar ese caso como conectado.
+      if (connectionFailed) return;
       console.log(`[POOL] Conectado ${station.code}/${channelInfo.channel}`);
       entry.connections[channelInfo.channel] = slConn;
       entry.connected = true;
