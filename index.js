@@ -2,6 +2,8 @@ import './polyfill.mjs';
 import express from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 import { SEISMIC_CONFIG } from './seismicConfig.js';
 import {
   subscribeUserToStations,
@@ -23,6 +25,50 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
 const clients = new Map();
+
+// Publica eventos confirmados en Firestore para que la Cloud Function
+// filtre por coordenadas y envíe FCM a los usuarios correspondientes.
+let firebaseDb = null;
+try {
+  const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (serviceAccount) {
+    const credentials = JSON.parse(serviceAccount);
+    initializeApp({ credential: cert(credentials) });
+  } else {
+    // Permite usar Application Default Credentials en Cloud Run/Compute.
+    initializeApp();
+  }
+  firebaseDb = getFirestore();
+  console.log('[FIREBASE] Firestore habilitado para publicación de eventos');
+} catch (error) {
+  console.warn(`[FIREBASE] Firestore no habilitado: ${error.message}`);
+}
+
+const publishedFirebaseEvents = new Set();
+
+async function publishEventToFirebase(alert, eventId, picks = []) {
+  if (!firebaseDb || alert.latitude == null || alert.longitude == null || publishedFirebaseEvents.has(eventId)) return;
+  publishedFirebaseEvents.add(eventId);
+  try {
+    await firebaseDb.collection('events').doc(eventId).set({
+      ...alert,
+      eventId,
+      stationPicks: picks.map((p) => ({
+        station: p.stationCode,
+        channel: p.channel,
+        pTime: p.pTime?.toISO?.() || p.pTime || null,
+        amplitude: p.amplitude ?? null,
+        latitude: p.lat ?? null,
+        longitude: p.lon ?? null,
+      })),
+      createdAt: new Date().toISOString(),
+    });
+    console.log(`[FIREBASE] Evento ${eventId} publicado`);
+  } catch (error) {
+    publishedFirebaseEvents.delete(eventId);
+    console.error(`[FIREBASE] Error publicando ${eventId}:`, error.message);
+  }
+}
 
 // === Envio de push notifications via Expo Push Service ===
 async function sendExpoPush(pushToken, title, body, data = {}) {
@@ -387,7 +433,7 @@ function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channe
 }
 
 // Manejar evento confirmado: localizar + magnitud + alerta temprana
-function handleConfirmedEvent(entry, event, broadcastFn) {
+async function handleConfirmedEvent(entry, event, broadcastFn) {
   const picks = event.picks;
 
   // 1. Localizar epicentro
@@ -417,6 +463,8 @@ function handleConfirmedEvent(entry, event, broadcastFn) {
     preliminaryLocation: location?.preliminaryLocation ?? true,
     residual: location?.residual ?? null,
   };
+
+  await publishEventToFirebase(alert, `evt_${event.id}`, picks);
 
   // 4. Enviar a cada usuario con su tiempo estimado de llegada S
   for (const clientId of entry.subscribers) {
@@ -632,7 +680,7 @@ app.get('/simulate', async (req, res) => {
 });
 
 // Procesar evento simulado confirmado
-function handleSimulatedEvent(event, epicenterLat, epicenterLon, mag, targetClientId) {
+async function handleSimulatedEvent(event, epicenterLat, epicenterLon, mag, targetClientId) {
   // Localizar epicentro (deberia aproximarse al lat/lon simulado)
   const location = locateEpicenter(event.picks);
 
@@ -665,6 +713,8 @@ function handleSimulatedEvent(event, epicenterLat, epicenterLon, mag, targetClie
     residual: location?.residual ?? null,
     simulated: true,
   };
+
+  await publishEventToFirebase(alert, `sim_${Date.now()}`, event.picks);
 
   // Enviar al cliente especifico o a todos
   for (const [clientId, client] of clients) {

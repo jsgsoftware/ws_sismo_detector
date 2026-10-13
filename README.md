@@ -150,6 +150,35 @@ ws.send(JSON.stringify({
 
 El servidor responde con las estaciones más cercanas y comienza a enviar waveform y alertas en tiempo real.
 
+## Firebase y notificaciones por radio
+
+Los eventos confirmados se publican en `events/{eventId}`. La Cloud Function
+`notifyNearbyUsers` calcula la distancia entre el epicentro y cada documento de
+`users` y envía FCM si está dentro de `radiusKm`.
+
+Cada usuario debe guardar esta estructura en Firestore:
+
+```json
+{
+  "latitude": 9.0412,
+  "longitude": -79.4174,
+  "radiusKm": 500,
+  "notificationsEnabled": true,
+  "fcmTokens": ["TOKEN_FCM_DEL_DISPOSITIVO"]
+}
+```
+
+El token debe ser FCM nativo (`getDevicePushTokenAsync` en Expo), no un token
+de Expo Push. Para publicar desde el servidor, configura
+`FIREBASE_SERVICE_ACCOUNT_JSON` como secreto del entorno de producción. Nunca
+subas ese JSON al repositorio.
+
+Despliegue de Firebase:
+
+```bash
+firebase deploy --only functions:notifyNearbyUsers,firestore:rules --project appsismo-fee42
+```
+
 ## Licencia
 
 ISC
