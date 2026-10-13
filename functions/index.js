@@ -19,7 +19,7 @@ function distanceKm(lat1, lon1, lat2, lon2) {
 }
 
 exports.notifyNearbyUsers = onDocumentCreated(
-  { document: 'events/{eventId}', region: 'us-central1', retry: true },
+  { document: 'events/{eventId}', region: 'us-central1' },
   async (event) => {
     const alert = event.data?.data();
     if (!alert || alert.latitude == null || alert.longitude == null) {
