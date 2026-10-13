@@ -30,9 +30,13 @@ const clients = new Map();
 // filtre por coordenadas y envíe FCM a los usuarios correspondientes.
 let firebaseDb = null;
 try {
-  const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (serviceAccount) {
-    const credentials = JSON.parse(serviceAccount);
+  const serviceAccountB64 = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64;
+  const serviceAccountPlain = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (serviceAccountB64) {
+    const credentials = JSON.parse(Buffer.from(serviceAccountB64, 'base64').toString('utf8'));
+    initializeApp({ credential: cert(credentials) });
+  } else if (serviceAccountPlain) {
+    const credentials = JSON.parse(serviceAccountPlain);
     initializeApp({ credential: cert(credentials) });
   } else {
     // Permite usar Application Default Credentials en Cloud Run/Compute.
