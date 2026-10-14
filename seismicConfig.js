@@ -26,9 +26,10 @@ export const SEISMIC_CONFIG = {
 
   // Correlacion multi-estacion
   correlation: {
-    minConfirmingStations: 2,      // minimo de estaciones para confirmar evento
+    minConfirmingStations: 3,      // minimo de estaciones para confirmar evento
     preferredStations: 3,           // ideal de estaciones
     windowSeconds: 15,              // ventana temporal para correlacion
+    maxStationDistanceKm: 1000,     // evitar mezclar regiones distantes
   },
 
   // Discriminacion P/S por relacion V/H

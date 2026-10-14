@@ -132,7 +132,10 @@ export class StaLtaDetector {
       }
 
       case PickerState.EVENT_IN_PROGRESS: {
-        // Evento en curso, capturar peak
+        // Re-arm after quiet time, otherwise this station detects only once.
+        if (ratio < triggerOff && timestamp.toMillis() - this.stateChangeTime.toMillis() > 30000) {
+          this.state = PickerState.COOLDOWN;
+        }
         return { state: this.state, ratio, amplitude };
       }
 

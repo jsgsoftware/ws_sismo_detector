@@ -1,355 +1,163 @@
-// stationPool.js
-// REESCRITO: pool de conexiones SeedLink con descubrimiento de canales Z/N/E,
-// obtencion de respuesta instrumental (StationXML), conversion counts->m/s,
-// filtrado de señal y deteccion STA/LTA con timestamp real del miniSEED.
+import { readFile } from 'node:fs/promises';
+import { miniseed } from 'seisplotjs/nodeonly';
+import { StaLtaDetector } from './services/phasePicker.js';
+import { preprocessSignal } from './services/signalProcessing.js';
+import { epicentralDistanceKm as distance } from './services/eventLocator.js';
+import { fetchText, loadLiveInventory, selectStrategicStations, STATION_LIMIT, MAX_DATA_AGE_MS } from './services/globalInventory.js';
+import { SeedlinkFeed } from './services/seedlinkFeed.js';
 
-import { seedlink, miniseed } from 'seisplotjs/nodeonly';
-import { DateTime } from 'luxon';
-import { execFile } from 'child_process';
-import { SEISMIC_CONFIG } from './seismicConfig.js';
-import { discoverChannels, getInstrumentResponse } from './services/stationMetadata.js';
-import { convertCountsToVelocity, applySensitivityOnly, getSegmentStartTime } from './services/instrumentResponse.js';
-import { preprocessSignal, segmentToFloatArray } from './services/signalProcessing.js';
-import { StaLtaDetector, PickerState, horizontalEnergy } from './services/phasePicker.js';
-import { registerPPick, registerSPick, getActiveEvents } from './services/eventCorrelator.js';
-import { locateEpicenter, epicentralDistanceKm, estimateSArrivalSeconds } from './services/eventLocator.js';
-import { calculateEventMagnitude } from './services/magnitudeCalculator.js';
+export let GLOBAL_STATIONS = [];
 
-const SEEDLINK_URL = 'wss://rtserve.earthscope.org/seedlink';
-const FDSN_STATION_URL = 'https://service.iris.edu/fdsnws/station/1/query';
-
-// Estaciones de fallback (se usan si la consulta FDSN falla al arrancar)
-const FALLBACK_STATIONS = [
-  { code: 'IU-ANMO', network: 'IU', station: 'ANMO', name: 'Albuquerque, USA', lat: 34.95, lon: -106.46 },
-  { code: 'IU-SSPA', network: 'IU', station: 'SSPA', name: 'State College, USA', lat: 40.80, lon: -77.87 },
-  { code: 'G-LPAZ', network: 'G', station: 'LPAZ', name: 'La Paz, Bolivia', lat: -16.29, lon: -68.13 },
-  { code: 'II-NNA', network: 'II', station: 'NNA', name: 'Nana, Peru', lat: -12.06, lon: -77.01 },
-];
-
-export let GLOBAL_STATIONS = [...FALLBACK_STATIONS];
-
-// Cargar estaciones dinamicamente desde el FDSN de IRIS
 export async function loadStationsFromFDSN() {
-  const url = `${FDSN_STATION_URL}?format=text&level=station&channel=BHZ&starttime=2026-01-01&includerestricted=false`;
-  console.log(`[FDSN] Consultando estaciones desde IRIS...`);
-
-  const curlResult = await loadWithCurl(url);
-  if (curlResult) return;
-
-  console.log(`[FDSN] curl fallo, intentando archivo local stations.txt...`);
-  const fileResult = await loadFromFile('stations.txt');
-  if (fileResult) return;
-
-  console.warn(`[FDSN] Usando fallback (${FALLBACK_STATIONS.length} estaciones)`);
-}
-
-function parseStationsText(text) {
-  const lines = text.split('\n').filter((l) => l.trim() && !l.startsWith('#'));
-  const stations = [];
-  for (const line of lines) {
-    const parts = line.split('|');
-    if (parts.length < 5) continue;
-    const network = parts[0].trim();
-    const stationCode = parts[1].trim();
-    const lat = parseFloat(parts[2]);
-    const lon = parseFloat(parts[3]);
-    const siteName = parts[5] ? parts[5].trim() : `${network}-${stationCode}`;
-    if (!network || !stationCode || isNaN(lat) || isNaN(lon)) continue;
-    stations.push({ code: `${network}-${stationCode}`, network, station: stationCode, name: siteName, lat, lon });
-  }
-  return stations;
-}
-
-function loadWithCurl(url) {
-  return new Promise((resolve) => {
-    const curl = process.platform === 'win32' ? 'curl.exe' : 'curl';
-    execFile(curl, ['-sL', '--max-time', '60', '-H', 'Connection: close', url],
-      { maxBuffer: 50 * 1024 * 1024, timeout: 70000 },
-      (err, stdout) => {
-        if (err || !stdout) { if (err) console.warn(`[FDSN] curl error: ${err.message}`); return resolve(false); }
-        const stations = parseStationsText(stdout);
-        if (stations.length > 0) {
-          GLOBAL_STATIONS = stations;
-          console.log(`[FDSN] ${stations.length} estaciones cargadas (curl)`);
-          resolve(true);
-        } else { resolve(false); }
-      });
-  });
-}
-
-function loadFromFile(path) {
-  return new Promise((resolve) => {
-    import('fs').then((fs) => {
-      fs.readFile(path, 'utf8', (err, data) => {
-        if (err) { console.warn(`[FDSN] No se pudo leer ${path}: ${err.message}`); return resolve(false); }
-        const stations = parseStationsText(data);
-        if (stations.length > 0) {
-          GLOBAL_STATIONS = stations;
-          console.log(`[FDSN] ${stations.length} estaciones cargadas (${path})`);
-          resolve(true);
-        } else { resolve(false); }
-      });
-    });
-  });
-}
-
-// =====================================================================
-//  Pool de conexiones
-// =====================================================================
-
-const connectionPool = new Map();
-
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
-
-export function findNearbyStations(lat, lon, radiusKm, maxStations = 3) {
-  const nearby = GLOBAL_STATIONS.map((s) => ({ ...s, distance: haversineKm(lat, lon, s.lat, s.lon) }))
-    .filter((s) => s.distance <= radiusKm)
-    .sort((a, b) => a.distance - b.distance)
-    .slice(0, maxStations);
-
-  if (nearby.length === 0) {
-    return GLOBAL_STATIONS.map((s) => ({ ...s, distance: haversineKm(lat, lon, s.lat, s.lon) }))
-      .sort((a, b) => a.distance - b.distance)
-      .slice(0, 2);
-  }
-  return nearby;
-}
-
-export async function subscribeUserToStations(clientId, userLat, userLon, radiusKm, onDataCallback, onAlertCallback) {
-  const stations = findNearbyStations(userLat, userLon, radiusKm);
-  const subscribedStations = [];
-
-  for (const station of stations) {
-    let entry = connectionPool.get(station.code);
-    if (!entry) {
-      entry = {
-        station,
-        connections: {},        // una conexion por canal (Z, N, E)
-        detectors: {},           // un StaLtaDetector por canal
-        responses: {},           // respuesta instrumental por canal
-        channels: null,          // inventario de canales Z/N/E
-        subscribers: new Set(),
-        connected: false,
-        lastDataTime: 0,
-        userLocations: new Map(), // clientId -> {lat, lon}
-      };
-      connectionPool.set(station.code, entry);
-      await setupStation(entry, onDataCallback, onAlertCallback);
-    }
-
-    entry.subscribers.add(clientId);
-    entry.userLocations.set(clientId, { lat: userLat, lon: userLon });
-    subscribedStations.push({ code: station.code, name: station.name, distance: station.distance, connected: entry.connected });
-  }
-  return subscribedStations;
-}
-
-// Configurar una estacion: descubrir canales, obtener respuestas, conectar SeedLink
-async function setupStation(entry, onDataCallback, onAlertCallback) {
-  const { station } = entry;
-  console.log(`[POOL] Configurando ${station.code} (${station.name})`);
-
-  // 1. Descubrir canales Z/N/E disponibles
-  const channels = await discoverChannels(station.network, station.station);
-  entry.channels = channels;
-
-  // 2. Obtener respuesta instrumental para cada canal disponible
-  const channelsToConnect = [];
-  if (channels.z) {
-    const respZ = await getInstrumentResponse(station.network, station.station, channels.z.location, channels.z.channel);
-    if (respZ) entry.responses[channels.z.channel] = respZ;
-    channelsToConnect.push({ ...channels.z, component: 'Z' });
-  }
-  if (channels.n) {
-    const respN = await getInstrumentResponse(station.network, station.station, channels.n.location, channels.n.channel);
-    if (respN) entry.responses[channels.n.channel] = respN;
-    channelsToConnect.push({ ...channels.n, component: 'N' });
-  }
-  if (channels.e) {
-    const respE = await getInstrumentResponse(station.network, station.station, channels.e.location, channels.e.channel);
-    if (respE) entry.responses[channels.e.channel] = respE;
-    channelsToConnect.push({ ...channels.e, component: 'E' });
-  }
-
-  // 3. Crear un detector STA/LTA por canal
-  for (const ch of channelsToConnect) {
-    const sampleRate = ch.sampleRate || 1;
-    entry.detectors[ch.channel] = new StaLtaDetector(ch.channel, sampleRate);
-  }
-
-  // 4. Conectar SeedLink para cada canal
-  for (const ch of channelsToConnect) {
-    connectToStationChannel(entry, ch, onDataCallback, onAlertCallback);
-  }
-}
-
-// Conectar a un canal especifico via SeedLink
-function connectToStationChannel(entry, channelInfo, onDataCallback, onAlertCallback) {
-  const { station } = entry;
-  // SeedLink v3 usa el formato LLSSS.T para los selectores:
-  // ubicación + canal + tipo. No lleva un punto entre ubicación y canal.
-  // Para una ubicación vacía, "--" representa los dos espacios del código.
-  const location = (channelInfo.location || '--').padEnd(2, ' ').slice(0, 2).replace(/ /g, '-');
-  const commands = [
-    `STATION ${station.network} ${station.station}`,
-    `SELECT ${location}${channelInfo.channel}.D`,
-  ];
-
-  console.log(`[POOL] Conectando a ${station.code} canal ${channelInfo.channel} (${channelInfo.component})`);
-
+  let text;
   try {
-    const startTime = DateTime.utc().minus({ seconds: 30 });
-    let connectionFailed = false;
-    const slConn = new seedlink.SeedlinkConnection(SEEDLINK_URL, commands,
-      (packet) => {
-        handleMiniseedPacket(entry, channelInfo, packet, onDataCallback, onAlertCallback);
-      },
-      (error) => {
-        connectionFailed = true;
-        console.error(`[POOL] Error ${station.code}/${channelInfo.channel}:`, error.message);
-        entry.connected = false;
-        scheduleReconnect(entry, channelInfo, onDataCallback, onAlertCallback);
+    text = await fetchText('https://service.earthscope.org/fdsnws/station/1/query?format=text&level=station&channel=BHZ,HHZ&includerestricted=false&endafter=' + new Date().toISOString().slice(0, 10));
+  } catch (error) {
+    console.warn('[FDSN] Catalog request failed:', error.message);
+    try { text = await readFile(new URL('./stations.txt', import.meta.url), 'utf8'); }
+    catch { return; }
+  }
+  const stations = new Map();
+  for (const line of text.split('\n')) {
+    if (!line.trim() || line.startsWith('#')) continue;
+    const p = line.split('|').map(v => v.trim());
+    const lat = Number(p[2]), lon = Number(p[3]);
+    if (p.length < 6 || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    const code = `${p[0]}-${p[1]}`;
+    stations.set(code, { code, network: p[0], station: p[1], lat, lon, name: p[5] || code });
+  }
+  GLOBAL_STATIONS = [...stations.values()];
+}
+
+export function findNearbyStations(lat, lon, radiusKm, maxStations = 3, catalog = GLOBAL_STATIONS) {
+  return catalog.map(s => ({ ...s, distance: distance(lat, lon, s.lat, s.lon) }))
+    .filter(s => s.distance <= radiusKm).sort((a, b) => a.distance - b.distance).slice(0, maxStations);
+}
+
+export class GlobalMonitor {
+  constructor({ inventory = loadLiveInventory, Feed = SeedlinkFeed, refreshMs = 15 * 60 * 1000 } = {}) {
+    Object.assign(this, { inventory, Feed, refreshMs });
+    this.entries = new Map(); this.users = new Map(); this.feeds = [];
+    this.status = 'stopped'; this.stopped = true; this.lastError = null;
+    this.lastRefreshAt = null; this.candidateCount = 0;
+  }
+  async start(onData, onAlert) {
+    if (!this.stopped) return;
+    this.stopped = false; this.onData = onData; this.onAlert = onAlert;
+    await this.refresh();
+  }
+  async refresh() {
+    if (this.stopped || this.refreshing) return;
+    this.refreshing = true; this.status = 'selecting';
+    try {
+      const candidates = await this.inventory(GLOBAL_STATIONS);
+      if (this.stopped) return;
+      this.candidateCount = candidates.length;
+      const selected = selectStrategicStations(candidates);
+      if (!selected.length) throw new Error('No recent calibrated vertical streams available');
+      const signature = selected.map(s => `${s.code}.${s.location}.${s.channel}`).sort().join(',');
+      if (signature !== this.signature) {
+        // Close old groups before replacements: at most three sockets.
+        this.feeds.forEach(f => f.stop());
+        const previous = this.entries;
+        this.entries = new Map(selected.map(station => {
+          const old = previous.get(station.code);
+          const same = old && old.station.location === station.location && old.station.channel === station.channel;
+          return [station.code, { station, channels: { z: { ...station, component: 'Z' } },
+            detectors: same ? old.detectors : {}, subscribers: new Set(), userLocations: new Map(),
+            lastDataTime: 0, lastSampleAt: same ? old.lastSampleAt : null,
+            packetCount: 0, processedPackets: 0, lastError: null }];
+        }));
+        for (const [id, user] of [...this.users]) this.subscribe(id, user.lat, user.lon, user.radiusKm);
+        const groups = [[], [], []];
+        selected.forEach((s, index) => groups[index % 3].push(s));
+        this.feedStates = [];
+        this.feeds = groups.filter(g => g.length).map((group, index) => new this.Feed(group,
+          packet => this.handlePacket(packet), (state, error) => {
+            this.feedStates[index] = { state, error: error || null };
+            if (error) console.warn(`[SEEDLINK ${index}] ${error}`);
+          }));
+        this.signature = signature;
+        this.feeds.forEach(f => f.start());
+      } else {
+        selected.forEach(station => { this.entries.get(station.code).station = station; });
       }
-    );
-    slConn.setOnClose(() => {
-      console.warn(`[POOL] Conexion cerrada ${station.code}/${channelInfo.channel}`);
-      entry.connected = false;
-      scheduleReconnect(entry, channelInfo, onDataCallback, onAlertCallback);
-    });
-    slConn.setTimeCommand(startTime);
-    slConn.connect().then(() => {
-      // seisplotjs llama al errorHandler y luego resuelve connect() con undefined
-      // cuando falla un comando SeedLink; no tratar ese caso como conectado.
-      if (connectionFailed) return;
-      console.log(`[POOL] Conectado ${station.code}/${channelInfo.channel}`);
-      entry.connections[channelInfo.channel] = slConn;
-      entry.connected = true;
-    }).catch((err) => {
-      console.error(`[POOL] Error al conectar ${station.code}/${channelInfo.channel}:`, err.message);
-      scheduleReconnect(entry, channelInfo, onDataCallback, onAlertCallback);
-    });
-  } catch (err) {
-    console.error(`[POOL] Error creando conexion ${station.code}/${channelInfo.channel}:`, err.message);
-    scheduleReconnect(entry, channelInfo, onDataCallback, onAlertCallback);
+      this.lastRefreshAt = new Date().toISOString(); this.lastError = null; this.status = 'monitoring';
+      console.log(`[GLOBAL] ${selected.length}/${STATION_LIMIT} selected from ${candidates.length} recent stations; ${this.feeds.length} sockets`);
+    } catch (error) {
+      this.lastError = error.message; this.status = 'degraded';
+      console.error('[GLOBAL]', error.message);
+    } finally {
+      this.refreshing = false;
+      if (!this.stopped) this.timer = setTimeout(() => this.refresh(), this.lastError ? 60000 : this.refreshMs);
+    }
   }
-}
-
-const reconnectTimers = new Map();
-
-function scheduleReconnect(entry, channelInfo, onDataCallback, onAlertCallback) {
-  const key = `${entry.station.code}_${channelInfo.channel}`;
-  if (reconnectTimers.has(key)) return;
-  reconnectTimers.set(key, setTimeout(() => {
-    reconnectTimers.delete(key);
-    if (entry.subscribers.size > 0) {
-      connectToStationChannel(entry, channelInfo, onDataCallback, onAlertCallback);
-    }
-  }, 5000));
-}
-
-// Procesar un paquete miniSEED: convertir a m/s, filtrar, detectar
-function handleMiniseedPacket(entry, channelInfo, packet, onDataCallback, onAlertCallback) {
-  try {
-    const msRecord = packet.miniseed;
-    if (!msRecord) return;
-
-    const segments = miniseed.seismogramSegmentPerChannel([msRecord]);
-    if (!segments || segments.length === 0) return;
-
-    const segment = segments[0];
-    const samples = segment.y;
-    if (!samples || samples.length === 0) return;
-
-    const sampleRate = segment.sampleRate;
-    const channelCode = segment.channelCode;
-    const response = entry.responses[channelCode];
-    entry.lastDataTime = Date.now();
-
-    // === 1. CONVERTIR COUNTS -> m/s (gainCorrect con sensibilidad instrumental) ===
-    let physicalSegment = null;
-    if (response) {
-      // Usar gainCorrect: aplica la sensibilidad para convertir counts -> m/s
-      // (desconvolucion completa con polos/ceros requiere level=response que
-      // tiene problemas de parsing con StationXML 1.1 de EarthScope)
-      physicalSegment = applySensitivityOnly(segment, response.sensitivity);
-    }
-    if (!physicalSegment) {
-      // Sin respuesta instrumental: no podemos procesar fisicamente
-      // Enviar counts crudos al cliente (para visualizacion) pero no detectar
-      if (onDataCallback) onDataCallback(entry, channelInfo, samples, sampleRate, channelCode, 'counts');
-      return;
-    }
-
-    // === 2. FILTRAR (demean + detrend + bandpass) ===
-    const filteredSegment = preprocessSignal(physicalSegment, sampleRate);
-    if (!filteredSegment) return;
-
-    const filteredSamples = segmentToFloatArray(filteredSegment);
-    if (!filteredSamples || filteredSamples.length === 0) return;
-
-    // === 3. Enviar waveform fisica (m/s) al cliente ===
-    if (onDataCallback) {
-      onDataCallback(entry, channelInfo, filteredSamples, sampleRate, channelCode, 'm/s');
-    }
-
-    // === 4. DETECCION STA/LTA con timestamp real ===
-    if (onAlertCallback) {
-      onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channelCode);
-    }
-  } catch (err) {
-    console.warn(`[POOL] Error procesando ${entry.station.code}/${channelCode}:`, err.message);
-  }
-}
-
-export function unsubscribeUser(clientId) {
-  for (const [code, entry] of connectionPool.entries()) {
-    entry.subscribers.delete(clientId);
-    entry.userLocations.delete(clientId);
-    if (entry.subscribers.size === 0) {
-      console.log(`[POOL] Cerrando conexion ${code} (sin suscriptores)`);
-      for (const [chanCode, conn] of Object.entries(entry.connections)) {
-        try { conn.close(); } catch (e) {}
+  handlePacket(packet) {
+    const header = packet.miniseed?.header;
+    if (!header) return;
+    const entry = this.entries.get(`${header.netCode}-${header.staCode}`);
+    if (!entry || header.chanCode !== entry.station.channel || header.locCode.trim() !== entry.station.location) return;
+    try {
+      const segment = miniseed.seismogramSegmentPerChannel([packet.miniseed])[0];
+      if (!segment?.y?.length) return;
+      const end = segment.endTime.toMillis(), now = Date.now();
+      if (!Number.isFinite(end) || now - end > MAX_DATA_AGE_MS || end > now + 5000) return;
+      if (entry.lastSampleAt != null && segment.startTime.toMillis() <= entry.lastSampleAt) return;
+      const { channel, sensitivity } = entry.station;
+      const gap = entry.lastSampleAt != null && segment.startTime.toMillis() - entry.lastSampleAt > 2000;
+      if (!entry.detectors[channel] || entry.detectors[channel].sampleRate !== segment.sampleRate || gap) {
+        entry.detectors[channel] = new StaLtaDetector(channel, segment.sampleRate);
       }
-      connectionPool.delete(code);
+      entry.lastDataTime = now; entry.lastSampleAt = end; entry.packetCount++;
+      const physical = segment.cloneWithNewData(Float32Array.from(segment.y, n => n / sensitivity.sensitivity));
+      physical.yUnit = 'm/s';
+      const filtered = preprocessSignal(physical, segment.sampleRate);
+      if (!filtered) { entry.lastError = 'Signal filter failed'; return; }
+      entry.processedPackets++; entry.lastError = null;
+      this.onData?.(entry, entry.channels.z, filtered.y, segment.sampleRate, channel, 'm/s');
+      this.onAlert?.(entry, entry.channels.z, filtered, segment.sampleRate, channel);
+    } catch (error) {
+      entry.lastError = error.message;
+      console.warn(`[GLOBAL] ${entry.station.code}: ${error.message}`);
     }
   }
-}
-
-export function getUserStations(clientId) {
-  const stations = [];
-  for (const [code, entry] of connectionPool.entries()) {
-    if (entry.subscribers.has(clientId)) {
-      stations.push({ code, name: entry.station.name, connected: entry.connected, subscribers: entry.subscribers.size });
+  subscribe(id, lat, lon, radiusKm) {
+    this.unsubscribe(id); this.users.set(id, { lat, lon, radiusKm });
+    for (const station of findNearbyStations(lat, lon, radiusKm, 3, [...this.entries.values()].map(e => e.station))) {
+      const entry = this.entries.get(station.code);
+      entry.subscribers.add(id); entry.userLocations.set(id, { lat, lon });
     }
+    return this.userStations(id);
   }
-  return stations;
+  unsubscribe(id) {
+    this.users.delete(id);
+    for (const e of this.entries.values()) { e.subscribers.delete(id); e.userLocations.delete(id); }
+    // User disconnects never control SeedLink lifetime.
+  }
+  isLive(e) { return e.lastDataTime > 0 && Date.now() - e.lastDataTime <= MAX_DATA_AGE_MS && Date.now() - e.lastSampleAt <= MAX_DATA_AGE_MS; }
+  userStations(id) {
+    return [...this.entries.values()].filter(e => e.subscribers.has(id)).map(e => ({ code: e.station.code,
+      name: e.station.name, connected: this.isLive(e), subscribers: e.subscribers.size }));
+  }
+  stats() {
+    const entries = [...this.entries.values()];
+    return { mode: 'global', stationLimit: STATION_LIMIT, status: this.status, lastError: this.lastError,
+      lastRefreshAt: this.lastRefreshAt, availableCandidates: this.candidateCount,
+      selectedStations: entries.length, totalConnections: this.feeds.length,
+      totalSubscribers: this.users.size, connectedStations: entries.filter(e => this.isLive(e)).length,
+      feeds: this.feedStates || [], stations: entries.map(e => ({ code: e.station.code, name: e.station.name,
+        lat: e.station.lat, lon: e.station.lon, connected: this.isLive(e), subscribers: e.subscribers.size,
+        channels: { z: e.station.channel }, location: e.station.location,
+        lastDataTime: e.lastDataTime || null, dataAgeMs: e.lastSampleAt ? Date.now() - e.lastSampleAt : null,
+        packetCount: e.packetCount, processedPackets: e.processedPackets, lastError: e.lastError })) };
+  }
+  stop() { this.stopped = true; clearTimeout(this.timer); this.feeds.forEach(f => f.stop()); this.status = 'stopped'; }
 }
 
-export function getPoolStats() {
-  let totalConnections = 0;
-  let totalSubscribers = 0;
-  let connectedStations = 0;
-  for (const [code, entry] of connectionPool.entries()) {
-    totalConnections++;
-    totalSubscribers += entry.subscribers.size;
-    if (entry.connected) connectedStations++;
-  }
-  return {
-    totalConnections,
-    totalSubscribers,
-    connectedStations,
-    stations: Array.from(connectionPool.entries()).map(([code, e]) => ({
-      code,
-      name: e.station.name,
-      subscribers: e.subscribers.size,
-      connected: e.connected,
-      channels: e.channels ? { z: e.channels.z?.channel, n: e.channels.n?.channel, e: e.channels.e?.channel } : null,
-    })),
-  };
-}
+const monitor = new GlobalMonitor();
+export const startGlobalMonitoring = (onData, onAlert) => monitor.start(onData, onAlert);
+export const stopGlobalMonitoring = () => monitor.stop();
+export const subscribeUserToStations = (id, lat, lon, radius) => monitor.subscribe(id, lat, lon, radius);
+export const unsubscribeUser = id => monitor.unsubscribe(id);
+export const getUserStations = id => monitor.userStations(id);
+export const getPoolStats = () => monitor.stats();

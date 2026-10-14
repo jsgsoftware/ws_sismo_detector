@@ -13,6 +13,8 @@ import {
   findNearbyStations,
   loadStationsFromFDSN,
   GLOBAL_STATIONS,
+  startGlobalMonitoring,
+  stopGlobalMonitoring,
 } from './stationPool.js';
 import { PickerState } from './services/phasePicker.js';
 import { registerPPick, registerSPick, getActiveEvents, cleanupOldEvents } from './services/eventCorrelator.js';
@@ -25,6 +27,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
 const clients = new Map();
+const firebaseStatus = { initialized: false, lastPublishedAt: null, lastError: null };
 
 // Publica eventos confirmados en Firestore para que la Cloud Function
 // filtre por coordenadas y envíe FCM a los usuarios correspondientes.
@@ -43,9 +46,11 @@ try {
     initializeApp();
   }
   firebaseDb = getFirestore();
-  console.log('[FIREBASE] Firestore habilitado para publicación de eventos');
+  firebaseStatus.initialized = true;
+  console.log('[FIREBASE] SDK inicializado; la primera escritura verificará las credenciales');
 } catch (error) {
   console.warn(`[FIREBASE] Firestore no habilitado: ${error.message}`);
+  firebaseStatus.lastError = 'Firebase initialization failed; check server logs';
 }
 
 const publishedFirebaseEvents = new Set();
@@ -54,12 +59,12 @@ async function publishEventToFirebase(alert, eventId, picks = []) {
   if (!firebaseDb || alert.latitude == null || alert.longitude == null || publishedFirebaseEvents.has(eventId)) return;
   publishedFirebaseEvents.add(eventId);
   try {
-    await firebaseDb.collection('events').doc(eventId).set({
+    await firebaseDb.collection('events').doc(eventId).create({
       ...alert,
       eventId,
       stationPicks: picks.map((p) => ({
         station: p.stationCode,
-        channel: p.channel,
+        channel: p.channel ?? null,
         pTime: p.pTime?.toISO?.() || p.pTime || null,
         amplitude: p.amplitude ?? null,
         latitude: p.lat ?? null,
@@ -68,8 +73,13 @@ async function publishEventToFirebase(alert, eventId, picks = []) {
       createdAt: new Date().toISOString(),
     });
     console.log(`[FIREBASE] Evento ${eventId} publicado`);
+    firebaseStatus.lastPublishedAt = new Date().toISOString();
+    firebaseStatus.lastError = null;
+    if (publishedFirebaseEvents.size > 5000) publishedFirebaseEvents.delete(publishedFirebaseEvents.values().next().value);
   } catch (error) {
+    if (error.code === 6 || error.code === 'already-exists') return;
     publishedFirebaseEvents.delete(eventId);
+    firebaseStatus.lastError = 'Event publication failed; check server logs';
     console.error(`[FIREBASE] Error publicando ${eventId}:`, error.message);
   }
 }
@@ -206,13 +216,14 @@ function haversineKm(lat1, lon1, lat2, lon2) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', clients: clients.size, pool: getPoolStats() });
+  res.json({ status: 'ok', clients: clients.size, pool: getPoolStats(), firebase: firebaseStatus });
 });
 
 app.get('/status', (req, res) => {
   res.json({
     clients: clients.size,
     pool: getPoolStats(),
+    firebase: firebaseStatus,
     stations: GLOBAL_STATIONS.length,
     config: SEISMIC_CONFIG,
   });
@@ -251,7 +262,11 @@ const server = app.listen(PORT, async () => {
   console.log(`Cargando estaciones desde IRIS FDSN...`);
   await loadStationsFromFDSN();
   console.log(`Estaciones globales disponibles: ${GLOBAL_STATIONS.length}`);
+  await startGlobalMonitoring(onDataCallback, onAlertCallback);
 });
+
+process.once('SIGTERM', () => { stopGlobalMonitoring(); server.close(); process.exit(0); });
+process.once('SIGINT', () => { stopGlobalMonitoring(); server.close(); process.exit(0); });
 
 const wss = new WebSocketServer({ server, path: '/ws', clientTracking: true });
 
@@ -391,7 +406,7 @@ function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channe
     const result = detector.process(value, timestamp);
 
     // Si se detecto un pick P, registrarlo en el correlador
-    if (result.type === 'P_DETECTED' && result.pPickTime) {
+    if (component === 'Z' && result?.type === 'P_DETECTED' && result.pPickTime) {
       const pick = {
         stationCode: station.code,
         pTime: result.pPickTime,
@@ -411,7 +426,7 @@ function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channe
           if (client && client.ws.readyState === client.ws.OPEN) {
             client.ws.send(JSON.stringify(event));
           }
-        });
+        }).catch(error => console.error('[EVENTO]', error.message));
       } else if (event && event.state === 'POSSIBLE_EVENT') {
         // Possible event de una sola estacion: no alertar todavia
         broadcastToSubscribers(entry, {
@@ -442,6 +457,9 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
 
   // 1. Localizar epicentro
   const location = locateEpicenter(picks);
+  // The regional locator is preliminary; never publish an invalid fit.
+  if (!location || !Number.isFinite(location.residual) || location.residual > SEISMIC_CONFIG.location.maxResidual
+    || Math.abs(location.latitude) > 90 || Math.abs(location.longitude) > 180) return;
 
   // 2. Calcular magnitud ML
   const picksWithVelocity = picks.map(p => ({
@@ -471,8 +489,7 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
   await publishEventToFirebase(alert, `evt_${event.id}`, picks);
 
   // 4. Enviar a cada usuario con su tiempo estimado de llegada S
-  for (const clientId of entry.subscribers) {
-    const client = clients.get(clientId);
+  for (const client of clients.values()) {
     if (!client || !client.location) continue;
     if (client.ws.readyState !== client.ws.OPEN) continue;
 
@@ -482,6 +499,7 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
     let userAlert = { ...alert };
     if (location) {
       userAlert.distanceKm = epicentralDistanceKm(location.latitude, location.longitude, userLat, userLon);
+      if (userAlert.distanceKm > client.radiusKm) continue;
       userAlert.estimatedSArrivalSeconds = estimateSArrivalSeconds(location, userLat, userLon);
     } else {
       userAlert.distanceKm = null;
@@ -491,20 +509,7 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
     client.ws.send(JSON.stringify(userAlert));
   }
 
-  // 4b. Enviar push notification a clientes con pushToken (incluso si WS cerrado)
-  for (const clientId of entry.subscribers) {
-    const client = clients.get(clientId);
-    if (!client || !client.location || !client.pushToken) continue;
-    let userAlert = { ...alert };
-    if (location) {
-      userAlert.distanceKm = epicentralDistanceKm(location.latitude, location.longitude, client.location.latitude, client.location.longitude);
-      userAlert.estimatedSArrivalSeconds = estimateSArrivalSeconds(location, client.location.latitude, client.location.longitude);
-    }
-    sendPushToClient(client, userAlert);
-  }
-
-  // 4b. Enviar push a todos los tokens registrados via HTTP (app cerrada)
-  sendPushToAllTokens(alert);
+  // Real-event push delivery is owned by the Firestore Cloud Function.
 
   // 5. Log para calibracion
   const logEntry = {

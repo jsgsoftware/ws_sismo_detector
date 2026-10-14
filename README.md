@@ -11,7 +11,8 @@ EarthScope SeedLink (wss://rtserve.earthscope.org/seedlink)
 [Pool de estaciones] (stationPool.js)
   - Carga dinámica de estaciones desde IRIS FDSN
   - Conexión reutilizable (pool)
-  - Apertura/cierre automático según suscriptores
+  - Hasta 300 estaciones, monitoreadas aunque no haya usuarios
+  - Tres conexiones SeedLink multiestación compartidas
   - Un detector sísmico por estación
     |
     v
@@ -29,11 +30,25 @@ EarthScope SeedLink (wss://rtserve.earthscope.org/seedlink)
 
 ## Reglas del pool de estaciones
 
-- 2477 estaciones globales cargadas dinámicamente desde IRIS FDSN
-- Cada usuario recibe solo las 2-3 estaciones más cercanas dentro de su radio
-- Si nadie usa una estación, se cierra automáticamente
-- Si otro usuario la necesita, se reutiliza sin abrir nueva conexión
+- El catálogo es independiente del monitoreo: como máximo 300 estaciones seleccionadas.
+- Solo canales verticales BHZ/HHZ con calibración en m/s y datos menores de 60 segundos.
+- Selección geográfica: primer punto cerca de Panamá, luego cubrir los mayores huecos;
+  cada punto incorpora hasta dos estaciones vecinas (20–500 km), si existen.
+- El criterio es una heurística de cobertura, no una red mundial de alerta temprana validada.
+- Se revisa disponibilidad cada 15 minutos. Si hay menos de 300 elegibles se informa el déficit.
+- Tres conexiones multiestación con reconexión y vigilancia de datos; los usuarios no abren ni cierran conexiones.
+- Las suscripciones WS solo eligen señales para visualizar entre las estaciones ya seleccionadas.
 - Un detector sísmico por estación (no por usuario)
+
+`/status` y `/health` muestran `pool.stationLimit`, `selectedStations`, `connectedStations`,
+`feeds` y la lista seleccionada con coordenadas, antigüedad y contadores de paquetes.
+`connectedStations` cuenta señales recientes recibidas, no solamente handshakes aceptados.
+`firebase.initialized` indica SDK inicializado; solo `lastPublishedAt` confirma una escritura.
+La detección/localización existente sigue siendo experimental: 300 estaciones no garantizan
+cobertura de todos los sismos ni latencia de milisegundos. No se suben señales crudas a Firestore.
+
+Pruebas sin Firebase ni notificaciones: `node --test tests/globalMonitor.test.js`.
+Prueba real de 3 minutos sin publicar alertas: `node scripts/check-global-monitor.mjs`.
 
 ## Requisitos
 

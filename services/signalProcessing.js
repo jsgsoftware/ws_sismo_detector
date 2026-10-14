@@ -26,10 +26,7 @@ export function preprocessSignal(segment, sampleRate) {
     const { lowHz, highHz, numPoles } = SEISMIC_CONFIG.filter;
     const nyquist = sampleRate / 2;
 
-    // Verificar que el filtro sea valido para el sample rate
-    if (highHz >= nyquist) {
-      console.warn(`[FILTER] highHz ${highHz} >= nyquist ${nyquist}, ajustando`);
-    }
+    // Clamp to Nyquist without logging on every packet of a 20 Hz stream.
     const adjustedHighHz = Math.min(highHz, nyquist * 0.8);
 
     // Crear filtro Butterworth band-pass

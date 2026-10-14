@@ -3,6 +3,7 @@
 // Una sola estacion genera "possible_event"; 2+ estaciones generan "confirmed_event".
 
 import { SEISMIC_CONFIG } from '../seismicConfig.js';
+import { epicentralDistanceKm } from './eventLocator.js';
 
 // Cola de picks recientes por estacion
 // Forma: Map<stationCode, { pTime, amplitude, lat, lon, sampleRate }>
@@ -34,12 +35,18 @@ export function registerPPick(pick) {
   const compatiblePicks = [];
   for (const [code, p] of recentPicks.entries()) {
     const diffSeconds = Math.abs((now.toMillis() - p.pTime.toMillis()) / 1000);
-    if (diffSeconds <= windowSeconds) {
+    if (diffSeconds <= windowSeconds &&
+      epicentralDistanceKm(p.lat, p.lon, pick.lat, pick.lon) <= SEISMIC_CONFIG.correlation.maxStationDistanceKm &&
+      compatiblePicks.every(other => epicentralDistanceKm(p.lat, p.lon, other.lat, other.lon) <= SEISMIC_CONFIG.correlation.maxStationDistanceKm)) {
       compatiblePicks.push(p);
     }
   }
 
   if (compatiblePicks.length >= minConfirmingStations) {
+    // A later pick from the same regional group must not create another alert.
+    const existing = activeEvents.find(e => compatiblePicks.some(p => e.picks.some(old =>
+      old.stationCode === p.stationCode && Math.abs(old.pTime.toMillis() - p.pTime.toMillis()) < 1000)));
+    if (existing) return null;
     // Tenemos un evento confirmado
     const event = {
       id: `evt_${Date.now()}_${eventIdCounter++}`,

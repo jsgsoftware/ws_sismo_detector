@@ -1,4 +1,9 @@
 node_modules
+**/node_modules
+.git
+.env*
+firebase-service-account*.json
+firebase-debug.log
 server.log
 server-err.log
 tunnel.log
