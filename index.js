@@ -262,7 +262,8 @@ const server = app.listen(PORT, async () => {
   console.log(`Cargando estaciones desde IRIS FDSN...`);
   await loadStationsFromFDSN();
   console.log(`Estaciones globales disponibles: ${GLOBAL_STATIONS.length}`);
-  await startGlobalMonitoring(onDataCallback, onAlertCallback);
+  // Iniciar monitoreo global sin bloquear — evita que el event loop se sature antes de que HTTP responda
+  startGlobalMonitoring(onDataCallback, onAlertCallback).catch(e => console.error('[GLOBAL] Error:', e.message));
 });
 
 process.once('SIGTERM', () => { stopGlobalMonitoring(); server.close(); process.exit(0); });
