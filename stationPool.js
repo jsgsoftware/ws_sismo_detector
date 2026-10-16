@@ -5,6 +5,7 @@ import { preprocessSignal } from './services/signalProcessing.js';
 import { epicentralDistanceKm as distance } from './services/eventLocator.js';
 import { fetchText, loadLiveInventory, selectStrategicStations, STATION_LIMIT, MAX_DATA_AGE_MS } from './services/globalInventory.js';
 import { SeedlinkFeed } from './services/seedlinkFeed.js';
+import { RawWindow } from './services/rawWindow.js';
 
 export let GLOBAL_STATIONS = [];
 
@@ -109,6 +110,8 @@ export class GlobalMonitor {
         entry.detectors[channel] = new StaLtaDetector(channel, segment.sampleRate);
       }
       entry.lastDataTime = now; entry.lastSampleAt = end; entry.packetCount++;
+      if (!entry.rawWindow || entry.rawWindow.rate !== segment.sampleRate || gap) entry.rawWindow = new RawWindow(segment.sampleRate);
+      entry.rawWindow.append(segment.y, segment.startTime.toMillis());
       const physical = segment.cloneWithNewData(Float32Array.from(segment.y, n => n / sensitivity.sensitivity));
       physical.yUnit = 'm/s';
       const filtered = preprocessSignal(physical, segment.sampleRate);
@@ -161,3 +164,11 @@ export const subscribeUserToStations = (id, lat, lon, radius) => monitor.subscri
 export const unsubscribeUser = id => monitor.unsubscribe(id);
 export const getUserStations = id => monitor.userStations(id);
 export const getPoolStats = () => monitor.stats();
+export function getRawPWindow(pick) {
+  const entry = monitor.entries.get(pick.stationCode);
+  if (!entry || entry.station.channel !== pick.channel || entry.station.location !== pick.location) return null;
+  const window = entry.rawWindow?.snapshot(pick.pTime.toMillis());
+  return window ? { ...window, stationCode: pick.stationCode, network: entry.station.network,
+    station: entry.station.station, location: entry.station.location, channel: entry.station.channel,
+    lat: entry.station.lat, lon: entry.station.lon } : null;
+}

@@ -46,25 +46,7 @@ export const SEISMIC_CONFIG = {
     confidenceThreshold: 0.5,
   },
 
-  // Magnitud ML (Local Magnitude)
-  magnitude: {
-    // Correccion de atenuacion Hutton-Boore (California, radio 1-100 km)
-    // ML = log10(A_mm) + 1.11 * log10(R_km) + 0.00189 * R_km - 2.09
-    // A_mm = amplitud en nanometros (simulacion Wood-Anderson)
-    // R_km = distancia hipocentral
-    attenuation: {
-      a: 1.11,
-      b: 0.00189,
-      c: -2.09,
-    },
-    woodAnderson: {
-      // Respuesta Wood-Anderson: torccion horizontal, T=0.8s, h=1.0, f0=1.0
-      // Para simular: convierte velocidad a desplazamiento y aplica la respuesta WA
-      staticMagnification: 2800,  // magnificacion estatica
-      period: 0.8,               // periodo natural (s)
-      damping: 0.8,              // amortiguamiento
-    },
-  },
+  // Legacy single-pick ML removed: magnitude requires raw windows + response.
 
   // PGA / movimiento del suelo
   groundMotion: {

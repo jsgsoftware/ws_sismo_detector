@@ -9,6 +9,8 @@ export function magnitudeFromPd(pdCm, distanceKm) {
   return 1.23 * Math.log10(pdCm) + 1.38 * Math.log10(distanceKm) + 5.39;
 }
 
+// Sensitivity-only prototype retained for numerical regression tests ONLY.
+// It is not used by the server and its output is rejected by estimatePWaveMagnitude.
 // Constant-memory four-second velocity window. Pre-trigger mean removes baseline.
 // Trapezoidal integration followed by a causal 2-pole Butterworth low-pass at 3 Hz.
 // Instrument sensitivity is NOT a full frequency-response deconvolution.
@@ -66,7 +68,8 @@ export function estimatePWaveMagnitude(picks, location) {
   const stations = new Map();
   for (const p of picks) {
     if (!p.stationCode || !Number.isFinite(p.lat) || !Number.isFinite(p.lon)
-      || Math.abs(p.lat) > 90 || Math.abs(p.lon) > 180 || p.pWindowSeconds !== 4) continue;
+      || Math.abs(p.lat) > 90 || Math.abs(p.lon) > 180 || p.pWindowSeconds !== 4
+      || p.responseCorrected !== true || p.responseMethod !== 'ObsPy-evalresp-DISP-all-stages') continue;
     const distanceKm = epicentralDistanceKm(location.latitude, location.longitude, p.lat, p.lon);
     // Reject windows likely to include S. Conservative policy using this server's
     // simplified surface travel times, not a measured S arrival or depth estimate.
@@ -80,6 +83,6 @@ export function estimatePWaveMagnitude(picks, location) {
   const mid = Math.floor(sorted.length / 2);
   const magnitude = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
   return { magnitude, magnitudeType: 'M_Pd', magnitudeStatus: 'experimental',
-    magnitudeMethod: 'KuyukAllen2013-Pd-approximate-processing', preliminaryMagnitude: true,
+    magnitudeMethod: 'KuyukAllen2013-Pd-ObsPy-response-v1', preliminaryMagnitude: true,
     stationMagnitudes, magnitudeUncertainty: null, pWindowSeconds: 4 };
 }

@@ -35,7 +35,8 @@ test('gaps and unconfirmed candidates cannot produce estimates', () => {
 });
 test('aggregation requires three unique usable stations, preserves unknown depth', () => {
   const location = {latitude: 0, longitude: 0, depth: null};
-  const picks = [1, 1.1, 1.2].map((lat, i) => ({stationCode: String(i), lat, lon: 0, pdCm: 0.01, pWindowSeconds: 4}));
+  const picks = [1, 1.1, 1.2].map((lat, i) => ({stationCode: String(i), lat, lon: 0, pdCm: 0.01, pWindowSeconds: 4,
+    responseCorrected: true, responseMethod: 'ObsPy-evalresp-DISP-all-stages'}));
   const result = estimatePWaveMagnitude(picks, location);
   assert.equal(result.magnitudeType, 'M_Pd');
   assert.equal(result.preliminaryMagnitude, true);
@@ -45,4 +46,5 @@ test('aggregation requires three unique usable stations, preserves unknown depth
   assert.equal(estimatePWaveMagnitude([picks[0], picks[0], picks[0]], location), null);
   assert.equal(estimatePWaveMagnitude(picks.map(p => ({...p, lat: 0.01})), location), null);
   assert.equal(estimatePWaveMagnitude(picks.map(p => ({...p, lat: 10})), location), null);
+  assert.equal(estimatePWaveMagnitude(picks.map(p => ({...p, responseCorrected: false})), location), null);
 });
