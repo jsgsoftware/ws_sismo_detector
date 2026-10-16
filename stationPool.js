@@ -115,7 +115,7 @@ export class GlobalMonitor {
       if (!filtered) { entry.lastError = 'Signal filter failed'; return; }
       entry.processedPackets++; entry.lastError = null;
       this.onData?.(entry, entry.channels.z, filtered.y, segment.sampleRate, channel, 'm/s');
-      this.onAlert?.(entry, entry.channels.z, filtered, segment.sampleRate, channel);
+      this.onAlert?.(entry, entry.channels.z, filtered, segment.sampleRate, channel, physical);
     } catch (error) {
       entry.lastError = error.message;
       console.warn(`[GLOBAL] ${entry.station.code}: ${error.message}`);

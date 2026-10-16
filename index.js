@@ -20,6 +20,9 @@ import { PickerState } from './services/phasePicker.js';
 import { registerPPick, registerSPick, getActiveEvents, cleanupOldEvents } from './services/eventCorrelator.js';
 import { locateEpicenter, epicentralDistanceKm, estimateSArrivalSeconds } from './services/eventLocator.js';
 import { calculateEventMagnitude } from './services/magnitudeCalculator.js';
+import { PWaveWindow, estimatePWaveMagnitude } from './services/pWaveMagnitude.js';
+
+const P_WAVE_MAGNITUDE_ENABLED = process.env.P_WAVE_MAGNITUDE_ENABLED === 'true';
 
 const app = express();
 app.use(cors());
@@ -226,6 +229,7 @@ app.get('/status', (req, res) => {
     firebase: firebaseStatus,
     stations: GLOBAL_STATIONS.length,
     config: SEISMIC_CONFIG,
+    magnitudeMode: P_WAVE_MAGNITUDE_ENABLED ? 'experimental-Pd-4s' : 'legacy-ML-approximation',
   });
 });
 
@@ -396,7 +400,7 @@ function onDataCallback(entry, channelInfo, samples, sampleRate, channelCode, un
 }
 
 // === Callback de deteccion: recibe segmento filtrado en m/s ===
-function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channelCode) {
+function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channelCode, physicalSegment) {
   const detector = entry.detectors[channelCode];
   if (!detector || !filteredSegment || !filteredSegment.y) return;
 
@@ -411,9 +415,20 @@ function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channe
 
     const result = detector.process(value, timestamp);
 
+    let completedPick = null;
+    if (P_WAVE_MAGNITUDE_ENABLED && component === 'Z' && physicalSegment) {
+      detector.pWaveWindow ??= new PWaveWindow(sampleRate);
+      completedPick = detector.pWaveWindow.push(physicalSegment.y[i], timestamp.toMillis(),
+        result?.type === 'P_PICK_CANDIDATE' ? {
+          stationCode: station.code, pTime: result.pPickTime, amplitude: result.amplitude,
+          lat: station.lat, lon: station.lon, sampleRate, channel: channelCode,
+        } : null, result?.type === 'P_DETECTED',
+        result?.state === 'IDLE' || result?.type === 'S_DETECTED');
+    }
+
     // Si se detecto un pick P, registrarlo en el correlador
-    if (component === 'Z' && result?.type === 'P_DETECTED' && result.pPickTime) {
-      const pick = {
+    if (component === 'Z' && (P_WAVE_MAGNITUDE_ENABLED ? completedPick : result?.type === 'P_DETECTED' && result.pPickTime)) {
+      const pick = completedPick ?? {
         stationCode: station.code,
         pTime: result.pPickTime,
         amplitude: result.amplitude,
@@ -445,7 +460,7 @@ function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channe
     }
 
     // Si se detecto un pick S
-    if (result.type === 'S_DETECTED' && result.sPickTime) {
+    if (result?.type === 'S_DETECTED' && result.sPickTime) {
       registerSPick(station.code, result.sPickTime, result.amplitude);
       broadcastToSubscribers(entry, {
         type: 's_wave_detected',
@@ -472,7 +487,11 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
     ...p,
     peakVelocityMs: p.amplitude,  // amplitud del pick P (aproximacion)
   }));
-  const magnitudeResult = calculateEventMagnitude(picksWithVelocity, location);
+  const magnitudeResult = P_WAVE_MAGNITUDE_ENABLED
+    ? estimatePWaveMagnitude(picks, location)
+    : calculateEventMagnitude(picksWithVelocity, location);
+  // Do not fall back to a single-sample ML or send an invented M0.
+  if (P_WAVE_MAGNITUDE_ENABLED && !magnitudeResult) return;
 
   // 3. Construir alerta
   const alert = {
@@ -483,6 +502,10 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
     depth: location?.depth ?? null,  // null: no se calcula
     magnitude: magnitudeResult?.magnitude ?? null,
     magnitudeType: magnitudeResult?.magnitudeType || 'ML',
+    preliminaryMagnitude: true,
+    magnitudeStatus: 'experimental',
+    magnitudeMethod: magnitudeResult?.magnitudeMethod ?? 'legacy-ML-approximation',
+    magnitudeUncertainty: null,
     stationMagnitudes: magnitudeResult?.stationMagnitudes || [],
     stationsUsed: event.numStations,
     pWaveDetected: true,

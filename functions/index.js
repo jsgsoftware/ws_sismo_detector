@@ -51,7 +51,7 @@ exports.notifyNearbyUsers = onDocumentCreated(
         messages.push({
           token,
           notification: {
-            title: `ALERTA SÍSMICA M${Number(alert.magnitude ?? 0).toFixed(1)}`,
+            title: `ALERTA SÍSMICA${Number.isFinite(alert.magnitude) ? ` M${alert.magnitude.toFixed(1)}` : ''}${alert.preliminaryMagnitude ? ' (preliminar)' : ''}`,
             body: `Sismo detectado a ${distance.toFixed(0)} km`,
           },
           data: {
@@ -60,6 +60,10 @@ exports.notifyNearbyUsers = onDocumentCreated(
             latitude: String(alert.latitude),
             longitude: String(alert.longitude),
             magnitude: String(alert.magnitude ?? ''),
+            magnitudeStatus: String(alert.magnitudeStatus ?? 'unknown'),
+            magnitudeType: String(alert.magnitudeType ?? ''),
+            preliminaryMagnitude: String(alert.preliminaryMagnitude === true),
+            depthStatus: alert.depth == null ? 'unknown' : 'estimated',
             distanceKm: distance.toFixed(2),
           },
           android: { priority: 'high', notification: { channelId: 'sismo-alertas' } },

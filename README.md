@@ -60,6 +60,37 @@ Prueba real de 3 minutos sin publicar alertas: `node scripts/check-global-monito
 
 ## Requisitos
 
+### Magnitud experimental de onda P
+
+Implementación opcional: `P_WAVE_MAGNITUDE_ENABLED=true`. Por defecto está
+desactivada y se conserva el cálculo ML aproximado anterior. `/status` expone
+`magnitudeMode`. No activar para alertas públicas antes de validar con registros
+históricos, magnitudes de catálogo y pruebas de entrega.
+
+El nuevo camino recoge 4 segundos desde el candidato P confirmado, usando velocidad
+vertical con sensibilidad corregida (no la señal band-pass de detección). Integra
+por trapecios, resta la media previa de 2 segundos y aplica un pasa-bajos Butterworth
+causal de dos polos a 3 Hz. Mantiene estado entre paquetes y rechaza ventanas con
+huecos. Añade al menos cuatro segundos de observación antes de correlacionar.
+
+Usa la ecuación 2 de [Kuyuk y Allen, 2013](https://seismo.berkeley.edu/~rallen/pub/2013kuyuk2/KuyukAllen-GlobalEEWMagRelation-GRL-2013.pdf):
+`M = 1.23 log10(Pd_cm) + 1.38 log10(distancia_epicentral_km) + 5.39`.
+Combina con mediana al menos tres estaciones únicas, hasta 250 km; rechaza ventanas
+con llegada S estimada dentro de esos 4 segundos según el modelo simple local.
+No sustituye una medición real de S: puede quedar contaminación sin detectar.
+
+La preparación instrumental es aproximada y requiere validación; no reproduce EPIC.
+La incertidumbre del estudio no se atribuye a este servidor. No hay garantía de
+cobertura con 40 estaciones ni de exactitud para eventos grandes (posible saturación).
+Si faltan estaciones válidas no publica el evento por este camino, ni recurre a ML.
+La profundidad continúa desconocida (`null`), no se estima mediante esta ecuación.
+
+Los eventos llevan `magnitudeType: M_Pd`, `preliminaryMagnitude: true`,
+`magnitudeStatus: experimental`, método y `magnitudeUncertainty: null`.
+La función incluye la etiqueta preliminar en el push; para aplicarla es necesario
+desplegar también `functions:notifyNearbyUsers`. Este cambio no modifica la app.
+Pruebas: `node --test tests/pWaveMagnitude.test.js tests/globalMonitor.test.js tests/rollingRms.test.js`.
+
 - Node.js 24+
 - Docker / Podman (opcional)
 
