@@ -22,10 +22,10 @@ test('metadata: correct scale/sample rate; current velocity channels only', () =
 
 const candidates = Array.from({length:500}, (_, i) => ({code:`XX-S${i}`, network:'XX', station:`S${i}`,
   location:'00',channel:'BHZ',lat:-75 + (i % 20)*8,lon:-175 + Math.floor(i / 20)*14,dataAgeMs:1000}));
-test('selection: hard cap 300, unique, geographic coverage rather than first 300', () => {
+test('selection: hard cap 40, unique, geographic distribution rather than first 40', () => {
   const s = selectStrategicStations([...candidates], 2476);
-  assert.equal(s.length, 300);
-  assert.equal(new Set(s.map(x=>x.code)).size, 300);
+  assert.equal(s.length, 40);
+  assert.equal(new Set(s.map(x=>x.code)).size, 40);
   assert.ok(s.some(x=>x.lon > 130)); assert.ok(s.some(x=>x.lon < -130));
   assert.ok(s.some(x=>x.lat > 50)); assert.ok(s.some(x=>x.lat < -50));
   assert.equal(selectStrategicStations(candidates.slice(0,4)).length,4);
@@ -37,10 +37,11 @@ test('global monitor starts without clients; disconnects never close feeds or en
   const m = new GlobalMonitor({Feed, inventory: async()=>[...candidates]});
   try {
     await m.start();
-    assert.equal(active,3); assert.equal(m.stats().selectedStations,300);
+    assert.equal(active,3); assert.equal(m.stats().selectedStations,40);
+    assert.equal(m.stats().stationLimit,40);
     assert.equal(m.stats().connectedStations,0); // handshake is not data
     m.subscribe('user',9,-79,20000); m.unsubscribe('user');
-    assert.equal(active,3); assert.equal(m.stats().selectedStations,300);
+    assert.equal(active,3); assert.equal(m.stats().selectedStations,40);
     assert.equal(m.stats().totalSubscribers,0);
   } finally { m.stop(); }
   assert.equal(active,0);

@@ -11,7 +11,7 @@ EarthScope SeedLink (wss://rtserve.earthscope.org/seedlink)
 [Pool de estaciones] (stationPool.js)
   - Carga dinámica de estaciones desde IRIS FDSN
   - Conexión reutilizable (pool)
-  - Hasta 300 estaciones, monitoreadas aunque no haya usuarios
+  - Hasta 40 estaciones, monitoreadas aunque no haya usuarios
   - Tres conexiones SeedLink multiestación compartidas
   - Un detector sísmico por estación
     |
@@ -30,12 +30,12 @@ EarthScope SeedLink (wss://rtserve.earthscope.org/seedlink)
 
 ## Reglas del pool de estaciones
 
-- El catálogo es independiente del monitoreo: como máximo 300 estaciones seleccionadas.
+- El catálogo es independiente del monitoreo: como máximo 40 estaciones seleccionadas.
 - Solo canales verticales BHZ/HHZ con calibración en m/s y datos menores de 60 segundos.
 - Selección geográfica: primer punto cerca de Panamá, luego cubrir los mayores huecos;
   cada punto incorpora hasta dos estaciones vecinas (20–500 km), si existen.
 - El criterio es una heurística de cobertura, no una red mundial de alerta temprana validada.
-- Se revisa disponibilidad cada 15 minutos. Si hay menos de 300 elegibles se informa el déficit.
+- Se revisa disponibilidad cada 15 minutos. Si hay menos de 40 elegibles se informa el déficit.
 - Tres conexiones multiestación con reconexión y vigilancia de datos; los usuarios no abren ni cierran conexiones.
 - Las suscripciones WS solo eligen señales para visualizar entre las estaciones ya seleccionadas.
 - Un detector sísmico por estación (no por usuario)
@@ -44,10 +44,18 @@ EarthScope SeedLink (wss://rtserve.earthscope.org/seedlink)
 `feeds` y la lista seleccionada con coordenadas, antigüedad y contadores de paquetes.
 `connectedStations` cuenta señales recientes recibidas, no solamente handshakes aceptados.
 `firebase.initialized` indica SDK inicializado; solo `lastPublishedAt` confirma una escritura.
-La detección/localización existente sigue siendo experimental: 300 estaciones no garantizan
-cobertura de todos los sismos ni latencia de milisegundos. No se suben señales crudas a Firestore.
+El límite se redujo de 300 a 40 para disminuir el procesamiento del servidor, a costa de
+menor cobertura. Se mantienen tres estaciones compatibles para confirmar un evento.
+La detección/localización sigue siendo experimental: no garantiza cobertura mundial
+ni latencia de milisegundos. No se suben señales crudas a Firestore.
 
 Pruebas sin Firebase ni notificaciones: `node --test tests/globalMonitor.test.js`.
+Pruebas de equivalencia y microbenchmark RMS: `node --test tests/rollingRms.test.js`.
+El detector usa ventanas circulares de memoria fija y sumas de cuadrados acumuladas
+(con recálculo periódico para limitar el error numérico), en lugar de recorrer toda
+la ventana por muestra. Los gráficos WS solo se preparan si hay suscriptores y se
+serializan una vez por paquete. Esto no cambia los umbrales de detección; el
+microbenchmark no mide el consumo total ni garantiza rendimiento en producción.
 Prueba real de 3 minutos sin publicar alertas: `node scripts/check-global-monitor.mjs`.
 
 ## Requisitos

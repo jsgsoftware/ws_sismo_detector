@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { epicentralDistanceKm as distance } from './eventLocator.js';
 
-export const STATION_LIMIT = 300;
+export const STATION_LIMIT = 40;
 export const MAX_DATA_AGE_MS = 60000;
 const exec = promisify(execFile);
 

@@ -361,6 +361,7 @@ async function handleClientMessage(clientId, msg) {
 const waveformLastSent = new Map();
 
 function onDataCallback(entry, channelInfo, samples, sampleRate, channelCode, unit) {
+  if (!entry.subscribers.size) return;
   const now = Date.now();
   const key = `${entry.station.code}_${channelCode}`;
   const lastSent = waveformLastSent.get(key) || 0;
@@ -374,10 +375,11 @@ function onDataCallback(entry, channelInfo, samples, sampleRate, channelCode, un
     downsampled.push(Math.round(samples[i] * 1e9) / 1e9);
   }
 
+  let payload;
   for (const clientId of entry.subscribers) {
     const client = clients.get(clientId);
     if (client && client.ws.readyState === client.ws.OPEN) {
-      client.ws.send(JSON.stringify({
+      payload ??= JSON.stringify({
         type: 'waveform',
         timestamp: new Date().toISOString(),
         samples: downsampled,
@@ -387,7 +389,8 @@ function onDataCallback(entry, channelInfo, samples, sampleRate, channelCode, un
         unit,  // 'm/s' o 'counts'
         station: entry.station.code,
         stationName: entry.station.name,
-      }));
+      });
+      client.ws.send(payload);
     }
   }
 }

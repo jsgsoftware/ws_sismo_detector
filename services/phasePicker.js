@@ -3,7 +3,7 @@
 // Reemplaza el detector anterior de umbrales fijos sobre counts.
 
 import { SEISMIC_CONFIG } from '../seismicConfig.js';
-import { rms } from './signalProcessing.js';
+import { RollingRms } from './rollingRms.js';
 
 // Estados del detector
 export const PickerState = {
@@ -28,8 +28,8 @@ export class StaLtaDetector {
     this.triggerOff = triggerOff;
 
     // Buffers circulares para STA y LTA
-    this.staBuffer = [];
-    this.ltaBuffer = [];
+    this.staBuffer = new RollingRms(this.staWindow);
+    this.ltaBuffer = new RollingRms(this.ltaWindow);
     this.maxStaBuffer = this.staWindow;
     this.maxLtaBuffer = this.ltaWindow;
 
@@ -55,10 +55,8 @@ export class StaLtaDetector {
 
     // Actualizar buffers
     this.staBuffer.push(absSample);
-    if (this.staBuffer.length > this.maxStaBuffer) this.staBuffer.shift();
 
     this.ltaBuffer.push(absSample);
-    if (this.ltaBuffer.length > this.maxLtaBuffer) this.ltaBuffer.shift();
 
     // Actualizar peak
     if (absSample > this.peakAmplitude) {
@@ -67,13 +65,13 @@ export class StaLtaDetector {
     }
 
     // Necesitamos suficientes samples para LTA
-    if (this.ltaBuffer.length < this.ltaWindow) {
+    if (this.ltaBuffer.count < this.ltaWindow) {
       return { state: this.state, ratio: 0 };
     }
 
     // Calcular STA y LTA (RMS)
-    const sta = rms(this.staBuffer);
-    const lta = rms(this.ltaBuffer);
+    const sta = this.staBuffer.rms;
+    const lta = this.ltaBuffer.rms;
     const ratio = lta > 0 ? sta / lta : 0;
     this.lastRatio = ratio;
 
@@ -193,8 +191,8 @@ export class StaLtaDetector {
     this.sAmplitude = 0;
     this.peakAmplitude = 0;
     this.peakVelocity = 0;
-    this.staBuffer = [];
-    this.ltaBuffer = [];
+    this.staBuffer.reset();
+    this.ltaBuffer.reset();
     this.lastRatio = 0;
   }
 

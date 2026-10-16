@@ -9,7 +9,7 @@ const timer = setTimeout(() => {
   console.log(JSON.stringify({ ...stats, processed,
     stations: stats.stations.filter(s => s.packetCount > 0).slice(0, 10) }, null, 2));
   monitor.stop();
-  process.exit(stats.selectedStations <= 300 && stats.connectedStations > 0 && processed > 0 ? 0 : 1);
+  process.exit(stats.selectedStations <= 40 && stats.connectedStations > 0 && processed > 0 ? 0 : 1);
 }, 180000);
 process.once('SIGINT', () => { clearTimeout(timer); monitor.stop(); process.exit(0); });
 await monitor.start(() => { processed++; }, () => {});
