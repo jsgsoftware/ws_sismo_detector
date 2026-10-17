@@ -350,3 +350,33 @@ El despliegue de reglas/funciones no carga automáticamente este catálogo.
 ## Licencia
 
 ISC
+# Archivo de señales por evento
+
+El servidor guarda únicamente ventanas de **eventos confirmados con localización aceptada**;
+no hace grabación continua en disco ni escribe muestras en Firestore. El buffer circular
+en RAM sigue activo para recuperar los 30 segundos anteriores a la llegada P.
+
+- Por cada estación participante se intenta conservar 30 s antes y 14 s después de P.
+- Formato: JSON comprimido (`.json.gz`), muestras decodificadas en cuentas digitales,
+  frecuencia de muestreo, tiempos, identificadores NSLC, coordenadas y picks.
+  No son los paquetes miniSEED originales ni incluye StationXML/respuesta instrumental.
+  Para recalcular magnitud con precisión también hace falta recuperar esa respuesta
+  para el canal y la fecha correspondientes; el archivo solo no garantiza ese cálculo.
+- Se guarda el canal monitoreado (normalmente vertical), no los tres componentes ni
+  todas las estaciones del mundo. No se archivan simulaciones o detecciones rechazadas.
+- Directorio predeterminado: `./data/event-waveforms`. Configurable mediante
+  `EVENT_ARCHIVE_DIR`. En Docker montar un **volumen persistente** en esa ruta
+  (preferiblemente configurar una ruta absoluta). Sin volumen se pierde al reemplazar el contenedor.
+- Límite: `EVENT_ARCHIVE_MAX_BYTES=1073741824` (1 GiB). Al alcanzarlo se dejan de
+  guardar archivos nuevos; no se borran los anteriores automáticamente. El límite aplica
+  a una instancia del servidor; no compartir el directorio entre varios procesos.
+- Firestore recibe solo `waveformArchive` con estado, nombre de archivo, tamaño y
+  estaciones faltantes, mediante una actualización posterior a publicar el evento.
+  El archivo permanece en el servidor, **no en Firebase Storage**; el nombre no es una URL pública.
+- La captura espera hasta 20 s sin bloquear las alertas y admite dos eventos simultáneos.
+  Huecos de datos, picks demasiado antiguos, saturación o fallos de disco se registran
+  como archivo parcial/no disponible/fallido. No se garantiza captura completa.
+- Cada evento archivado implica una escritura adicional de metadatos en Firestore.
+  El disparador de notificaciones `onDocumentCreated` no se vuelve a ejecutar por esta actualización.
+
+Pruebas: `node --test tests/eventArchive.test.js`.

@@ -21,6 +21,9 @@ import { PickerState } from './services/phasePicker.js';
 import { registerPPick, registerSPick, getActiveEvents, cleanupOldEvents } from './services/eventCorrelator.js';
 import { locateEpicenter, epicentralDistanceKm, estimateSArrivalSeconds } from './services/eventLocator.js';
 import { calculateResponseMagnitude } from './services/responseMagnitude.js';
+import { EventArchive } from './services/eventArchive.js';
+
+const eventArchive = new EventArchive();
 
 const P_WAVE_MAGNITUDE_ENABLED = process.env.P_WAVE_MAGNITUDE_ENABLED === 'true';
 
@@ -474,6 +477,8 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
     || Math.abs(location.latitude) > 90 || Math.abs(location.longitude) > 180) return;
 
   // Detection and magnitude availability are separate. Never resurrect legacy ML.
+  const eventId = `evt_${event.id}`;
+  const archiveTask = eventArchive.capture(eventId, picks, getRawPWindow);
   const magnitudeResult = await calculateResponseMagnitude(picks, location, getRawPWindow);
 
   // 3. Construir alerta
@@ -500,7 +505,13 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
     residual: location?.residual ?? null,
   };
 
-  await publishEventToFirebase(alert, `evt_${event.id}`, picks);
+  await publishEventToFirebase(alert, eventId, picks);
+  // Never delay FCM delivery for waveform collection. update() cannot create an
+  // incomplete event or trigger the onDocumentCreated notification a second time.
+  void archiveTask.then(async metadata => {
+    console.log(`[ARCHIVE] ${eventId}: ${metadata.status} ${metadata.reason || metadata.file || ''}`);
+    if (firebaseDb) await firebaseDb.collection('events').doc(eventId).update({ waveformArchive: metadata });
+  }).catch(error => console.warn(`[ARCHIVE] Metadata update failed for ${eventId}: ${error.message}`));
 
   // 4. Enviar a cada usuario con su tiempo estimado de llegada S
   for (const client of clients.values()) {

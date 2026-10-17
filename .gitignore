@@ -26,3 +26,4 @@ firebase-service-account*.json
 functions/.env
 .venv-magnitude/
 __pycache__/
+data/event-waveforms/
