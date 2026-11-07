@@ -11,7 +11,7 @@ EarthScope SeedLink (wss://rtserve.earthscope.org/seedlink)
 [Pool de estaciones] (stationPool.js)
   - Carga dinámica de estaciones desde IRIS FDSN
   - Conexión reutilizable (pool)
-  - Hasta 300 estaciones, monitoreadas aunque no haya usuarios
+  - Hasta 40 estaciones, monitoreadas aunque no haya usuarios
   - Tres conexiones SeedLink multiestación compartidas
   - Un detector sísmico por estación
     |
@@ -30,12 +30,12 @@ EarthScope SeedLink (wss://rtserve.earthscope.org/seedlink)
 
 ## Reglas del pool de estaciones
 
-- El catálogo es independiente del monitoreo: como máximo 300 estaciones seleccionadas.
+- El catálogo es independiente del monitoreo: como máximo 40 estaciones seleccionadas.
 - Solo canales verticales BHZ/HHZ con calibración en m/s y datos menores de 60 segundos.
 - Selección geográfica: primer punto cerca de Panamá, luego cubrir los mayores huecos;
   cada punto incorpora hasta dos estaciones vecinas (20–500 km), si existen.
 - El criterio es una heurística de cobertura, no una red mundial de alerta temprana validada.
-- Se revisa disponibilidad cada 15 minutos. Si hay menos de 300 elegibles se informa el déficit.
+- Se revisa disponibilidad cada 15 minutos. Si hay menos de 40 elegibles se informa el déficit.
 - Tres conexiones multiestación con reconexión y vigilancia de datos; los usuarios no abren ni cierran conexiones.
 - Las suscripciones WS solo eligen señales para visualizar entre las estaciones ya seleccionadas.
 - Un detector sísmico por estación (no por usuario)
@@ -44,13 +44,85 @@ EarthScope SeedLink (wss://rtserve.earthscope.org/seedlink)
 `feeds` y la lista seleccionada con coordenadas, antigüedad y contadores de paquetes.
 `connectedStations` cuenta señales recientes recibidas, no solamente handshakes aceptados.
 `firebase.initialized` indica SDK inicializado; solo `lastPublishedAt` confirma una escritura.
-La detección/localización existente sigue siendo experimental: 300 estaciones no garantizan
-cobertura de todos los sismos ni latencia de milisegundos. No se suben señales crudas a Firestore.
+El límite se redujo de 300 a 40 para disminuir el procesamiento del servidor, a costa de
+menor cobertura. Se mantienen tres estaciones compatibles para confirmar un evento.
+La detección/localización sigue siendo experimental: no garantiza cobertura mundial
+ni latencia de milisegundos. No se suben señales crudas a Firestore.
 
 Pruebas sin Firebase ni notificaciones: `node --test tests/globalMonitor.test.js`.
+Pruebas de equivalencia y microbenchmark RMS: `node --test tests/rollingRms.test.js`.
+El detector usa ventanas circulares de memoria fija y sumas de cuadrados acumuladas
+(con recálculo periódico para limitar el error numérico), en lugar de recorrer toda
+la ventana por muestra. Los gráficos WS solo se preparan si hay suscriptores y se
+serializan una vez por paquete. Esto no cambia los umbrales de detección; el
+microbenchmark no mide el consumo total ni garantiza rendimiento en producción.
 Prueba real de 3 minutos sin publicar alertas: `node scripts/check-global-monitor.mjs`.
 
 ## Requisitos
+
+### Magnitud experimental de onda P
+
+Implementación opcional: `P_WAVE_MAGNITUDE_ENABLED=true`. Por defecto está
+desactivada: se guarda `magnitude: null`, nunca la ML defectuosa anterior. `/status` expone
+`magnitudeMode`. No activar para alertas públicas antes de validar con registros
+históricos, magnitudes de catálogo y pruebas de entrega.
+
+El nuevo camino conserva 60 segundos de counts crudos por estación en un buffer
+circular. Tras confirmar un evento recoge 30 segundos previos a P, los primeros
+4 segundos de P y 10 segundos de margen posterior. Rechaza huecos y cambios de canal.
+ObsPy/evalresp obtiene StationXML `level=response` para el NSLC y época completos,
+elimina la respuesta instrumental de todas sus etapas y devuelve desplazamiento
+en metros. Después aplica un pasa-bajos causal de dos polos a 3 Hz, mide Pd en la
+ventana P y convierte a cm. Nunca aplica el factor 2800 ni convierte una muestra
+de velocidad en magnitud. No utiliza el filtro 1–10 Hz del detector para medir Pd.
+
+La eliminación de respuesta usa prefiltrado 0.05/0.1/8/10 Hz (esquinas altas
+ajustadas a Nyquist), taper 5% y `water_level=60` dB para no invertir ceros de respuesta.
+El water level puede atenuar frecuencias válidas: evaluar esa sensibilidad con
+instrumentos reales. Son decisiones de implementación
+que requieren validación, no una reproducción certificada de EPIC. Los datos de
+relleno posteriores introducen latencia; este modo no promete alerta temprana.
+Se espera hasta 20 s por ventanas y hasta 45 s por el proceso externo. Solo un
+evento puede usar el worker a la vez, máximo 8 estaciones y un hilo BLAS; los demás
+se conservan con magnitud desconocida, sin cola ilimitada. La detección continúa.
+
+Usa la ecuación 2 de [Kuyuk y Allen, 2013](https://seismo.berkeley.edu/~rallen/pub/2013kuyuk2/KuyukAllen-GlobalEEWMagRelation-GRL-2013.pdf):
+`M = 1.23 log10(Pd_cm) + 1.38 log10(distancia_epicentral_km) + 5.39`.
+Combina con mediana al menos tres estaciones únicas, hasta 250 km; rechaza ventanas
+con llegada S estimada dentro de esos 4 segundos según el modelo simple local.
+No sustituye una medición real de S: puede quedar contaminación sin detectar.
+
+La preparación instrumental completa requiere validación con datos reales; no reproduce EPIC.
+La incertidumbre del estudio no se atribuye a este servidor. No hay garantía de
+cobertura con 40 estaciones ni de exactitud para eventos grandes (posible saturación).
+Si faltan estaciones válidas, falla Python o falta la respuesta, guarda el evento
+con magnitud desconocida y `magnitudeReason`; nunca recurre a ML.
+La profundidad continúa desconocida (`null`), no se estima mediante esta ecuación.
+
+Los eventos llevan `magnitudeType: M_Pd`, `preliminaryMagnitude: true`,
+`magnitudeStatus: experimental`, método y `magnitudeUncertainty: null`.
+La función incluye la etiqueta preliminar en el push; para aplicarla es necesario
+desplegar también `functions:notifyNearbyUsers`. Para magnitud desconocida el push
+omite el campo numérico (no cadena vacía ni cero) y muestra «magnitud no determinada».
+La función no envía eventos marcados como simulación. Los registros históricos
+no se reescriben; no se pueden recalcular a partir de sus amplitudes puntuales.
+La app debe aceptar valores desconocidos: no usar `Number(null)`, `Number('')`
+ni `magnitude ?? 0`. Versiones antiguas requieren actualizarse.
+Pruebas: `node --test tests/pWaveMagnitude.test.js tests/globalMonitor.test.js tests/rollingRms.test.js`.
+
+Instalación local opcional del worker (PowerShell, desde la raíz):
+
+```powershell
+python -m venv .venv-magnitude
+.\.venv-magnitude\Scripts\python.exe -m pip install -r scripts/requirements-magnitude.txt
+$env:MAGNITUDE_PYTHON = (Resolve-Path .\.venv-magnitude\Scripts\python.exe).Path
+.\.venv-magnitude\Scripts\python.exe scripts/test_measure_pd.py
+node --test tests/responseMagnitude.test.js
+```
+
+El Dockerfile incluye Python y ObsPy. Reconstruir la imagen para aplicar el cambio.
+No activar `P_WAVE_MAGNITUDE_ENABLED=true` públicamente solo por pasar pruebas
+sintéticas: aún falta comparar ventanas reales con un catálogo de referencia.
 
 - Node.js 24+
 - Docker / Podman (opcional)
@@ -183,17 +255,128 @@ Cada usuario debe guardar esta estructura en Firestore:
 }
 ```
 
-El token debe ser FCM nativo (`getDevicePushTokenAsync` en Expo), no un token
+El token debe ser FCM nativo (`getToken` de React Native Firebase en Android/iOS), no un token
 de Expo Push. Para publicar desde el servidor, configura
 `FIREBASE_SERVICE_ACCOUNT_JSON` como secreto del entorno de producción. Nunca
 subas ese JSON al repositorio.
 
-Despliegue de Firebase:
+### Desplegar la Cloud Function
+
+Proyecto: `appsismo-fee42`, función Gen 2 `notifyNearbyUsers`, región `us-central1`.
+Se dispara al crear `events/{eventId}`; no tiene una URL HTTP para que la app envíe
+solicitudes. Requiere Firestore `(default)`, facturación Blaze y permisos de despliegue.
+Ejecutar desde la raíz, no desde `functions/`:
+
+```powershell
+npm install -g firebase-tools
+firebase login
+npm ci --prefix functions
+$env:FUNCTIONS_DISCOVERY_TIMEOUT = '60'
+firebase deploy --only functions:notifyNearbyUsers --project appsismo-fee42
+firebase functions:list --project appsismo-fee42
+firebase functions:log --only notifyNearbyUsers --project appsismo-fee42
+```
+
+El runtime declarado actualmente en `functions/package.json` es Node 20: revisar
+su soporte y migrarlo con pruebas antes de que Firebase bloquee nuevos despliegues.
+El código del servidor y la función se despliegan por separado; un `git push`
+no confirma ninguno de los dos. El Admin SDK dentro de la función usa su identidad
+de Google; no subir archivos privados al directorio `functions`.
+
+Orden de actualización: primero la función que acepta magnitud desconocida, luego
+la app compatible y después el servidor. Una función antigua puede convertir
+`null` a M0; una app antigua puede guardar magnitud desconocida como cero o ignorar
+el mensaje en primer plano. No considerar la actualización completada sin probar
+estos casos en un dispositivo de prueba.
+
+Las reglas se despliegan por separado **tras compararlas con las reglas existentes**
+para no retirar acceso de otras colecciones del proyecto compartido:
 
 ```bash
-firebase deploy --only functions:notifyNearbyUsers,firestore:rules --project appsismo-fee42
+firebase deploy --only firestore:rules --project appsismo-fee42
 ```
+
+Si el CLI indica «Functions successfully deployed» seguido de un error de política
+de limpieza, la función puede haber quedado desplegada: verificar `functions:list`.
+Opcionalmente configurar eliminación de imágenes antiguas (borra artefactos de
+compilación, no documentos Firestore):
+
+```powershell
+firebase functions:artifacts:setpolicy --location us-central1 --days 7 --project appsismo-fee42
+```
+
+Consultar [gestión de funciones](https://firebase.google.com/docs/functions/manage-functions)
+y [credenciales administrativas](https://firebase.google.com/docs/admin/setup).
+No llamar `/simulate` para comprobar el despliegue: puede afectar clientes reales.
+
+### Crear estaciones en Firestore
+
+La colección `stations` es un catálogo opcional; no controla el pool ni dispara
+`notifyNearbyUsers`. Tener miles de documentos no abre miles de conexiones: el
+servidor selecciona como máximo 40 de su inventario EarthScope. El monitoreo y
+los push no requieren que el catálogo se copie a Firestore.
+
+Para crear documentos manualmente:
+
+1. Abrir Firebase Console → `appsismo-fee42` → Firestore Database → `(default)`.
+2. Crear la colección `stations` (si ya existe, abrirla).
+3. Consultar `/stations` en el servidor para obtener nombres y coordenadas. Para
+   ver únicamente la selección del monitor, consultar `/status` → `pool.stations`.
+4. Usar como ID el `code`, por ejemplo `CU-BCIP`. No usar un ID aleatorio: así una
+   actualización puede dirigirse al mismo documento sin duplicarlo.
+5. Crear los campos `code`, `network`, `station`, `name` como strings y
+   `latitude`, `longitude` como números (copiar `lat`/`lon` del servidor).
+
+Ejemplo basado en las coordenadas del evento analizado; verificar el catálogo
+actual antes de cargarlo:
+
+```json
+{
+  "code": "CU-BCIP",
+  "network": "CU",
+  "station": "BCIP",
+  "name": "CU-BCIP",
+  "latitude": 9.1665,
+  "longitude": -79.8373
+}
+```
+
+Usar el nombre descriptivo devuelto por `/stations` cuando esté disponible.
+No poner `active: true` como prueba de conexión: la disponibilidad real se consulta
+en `/health`. Crear estaciones no crea usuarios ni tokens: la app registra
+`users/{uid}` con Auth; la función consulta `users`, no `stations` ni `pushDevices`.
+El despliegue de reglas/funciones no carga automáticamente este catálogo.
 
 ## Licencia
 
 ISC
+# Archivo de señales por evento
+
+El servidor guarda únicamente ventanas de **eventos confirmados con localización aceptada**;
+no hace grabación continua en disco ni escribe muestras en Firestore. El buffer circular
+en RAM sigue activo para recuperar los 30 segundos anteriores a la llegada P.
+
+- Por cada estación participante se intenta conservar 30 s antes y 14 s después de P.
+- Formato: JSON comprimido (`.json.gz`), muestras decodificadas en cuentas digitales,
+  frecuencia de muestreo, tiempos, identificadores NSLC, coordenadas y picks.
+  No son los paquetes miniSEED originales ni incluye StationXML/respuesta instrumental.
+  Para recalcular magnitud con precisión también hace falta recuperar esa respuesta
+  para el canal y la fecha correspondientes; el archivo solo no garantiza ese cálculo.
+- Se guarda el canal monitoreado (normalmente vertical), no los tres componentes ni
+  todas las estaciones del mundo. No se archivan simulaciones o detecciones rechazadas.
+- Directorio predeterminado: `./data/event-waveforms`. Configurable mediante
+  `EVENT_ARCHIVE_DIR`. En Docker montar un **volumen persistente** en esa ruta
+  (preferiblemente configurar una ruta absoluta). Sin volumen se pierde al reemplazar el contenedor.
+- Límite: `EVENT_ARCHIVE_MAX_BYTES=1073741824` (1 GiB). Al alcanzarlo se dejan de
+  guardar archivos nuevos; no se borran los anteriores automáticamente. El límite aplica
+  a una instancia del servidor; no compartir el directorio entre varios procesos.
+- Firestore recibe solo `waveformArchive` con estado, nombre de archivo, tamaño y
+  estaciones faltantes, mediante una actualización posterior a publicar el evento.
+  El archivo permanece en el servidor, **no en Firebase Storage**; el nombre no es una URL pública.
+- La captura espera hasta 20 s sin bloquear las alertas y admite dos eventos simultáneos.
+  Huecos de datos, picks demasiado antiguos, saturación o fallos de disco se registran
+  como archivo parcial/no disponible/fallido. No se garantiza captura completa.
+- Cada evento archivado implica una escritura adicional de metadatos en Firestore.
+  El disparador de notificaciones `onDocumentCreated` no se vuelve a ejecutar por esta actualización.
+
+Pruebas: `node --test tests/eventArchive.test.js`.

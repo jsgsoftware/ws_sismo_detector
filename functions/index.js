@@ -3,6 +3,7 @@ const { logger } = require('firebase-functions');
 const { initializeApp } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const { getMessaging } = require('firebase-admin/messaging');
+const { alertPayload } = require('./alertPayload');
 
 initializeApp();
 const db = getFirestore();
@@ -22,6 +23,7 @@ exports.notifyNearbyUsers = onDocumentCreated(
   { document: 'events/{eventId}', region: 'us-central1' },
   async (event) => {
     const alert = event.data?.data();
+    if (alert?.simulated || alert?.magnitudeStatus === 'simulated') return;
     if (!alert || alert.latitude == null || alert.longitude == null) {
       logger.warn('Evento sin coordenadas; no se envían notificaciones');
       return;
@@ -50,18 +52,7 @@ exports.notifyNearbyUsers = onDocumentCreated(
         tokenOwners.set(token, userDoc.ref);
         messages.push({
           token,
-          notification: {
-            title: `ALERTA SÍSMICA M${Number(alert.magnitude ?? 0).toFixed(1)}`,
-            body: `Sismo detectado a ${distance.toFixed(0)} km`,
-          },
-          data: {
-            type: 'earthquake_alert',
-            eventId: String(event.params.eventId),
-            latitude: String(alert.latitude),
-            longitude: String(alert.longitude),
-            magnitude: String(alert.magnitude ?? ''),
-            distanceKm: distance.toFixed(2),
-          },
+          ...alertPayload(alert, event.params.eventId, distance),
           android: { priority: 'high', notification: { channelId: 'sismo-alertas' } },
         });
       }

@@ -1,4 +1,7 @@
 node_modules
+data/event-waveforms
+.venv-magnitude
+**/__pycache__
 **/node_modules
 .git
 .env*

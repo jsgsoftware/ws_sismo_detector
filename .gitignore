@@ -24,3 +24,6 @@ kill-port.ps1
 # Firebase credentials
 firebase-service-account*.json
 functions/.env
+.venv-magnitude/
+__pycache__/
+data/event-waveforms/

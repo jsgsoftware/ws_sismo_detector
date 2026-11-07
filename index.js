@@ -15,11 +15,17 @@ import {
   GLOBAL_STATIONS,
   startGlobalMonitoring,
   stopGlobalMonitoring,
+  getRawPWindow,
 } from './stationPool.js';
 import { PickerState } from './services/phasePicker.js';
 import { registerPPick, registerSPick, getActiveEvents, cleanupOldEvents } from './services/eventCorrelator.js';
 import { locateEpicenter, epicentralDistanceKm, estimateSArrivalSeconds } from './services/eventLocator.js';
-import { calculateEventMagnitude } from './services/magnitudeCalculator.js';
+import { calculateResponseMagnitude } from './services/responseMagnitude.js';
+import { EventArchive } from './services/eventArchive.js';
+
+const eventArchive = new EventArchive();
+
+const P_WAVE_MAGNITUDE_ENABLED = process.env.P_WAVE_MAGNITUDE_ENABLED === 'true';
 
 const app = express();
 app.use(cors());
@@ -65,6 +71,7 @@ async function publishEventToFirebase(alert, eventId, picks = []) {
       stationPicks: picks.map((p) => ({
         station: p.stationCode,
         channel: p.channel ?? null,
+        location: p.location ?? null,
         pTime: p.pTime?.toISO?.() || p.pTime || null,
         amplitude: p.amplitude ?? null,
         latitude: p.lat ?? null,
@@ -226,6 +233,7 @@ app.get('/status', (req, res) => {
     firebase: firebaseStatus,
     stations: GLOBAL_STATIONS.length,
     config: SEISMIC_CONFIG,
+    magnitudeMode: P_WAVE_MAGNITUDE_ENABLED ? 'experimental-Pd-full-response' : 'unknown-no-validated-estimator',
   });
 });
 
@@ -361,6 +369,7 @@ async function handleClientMessage(clientId, msg) {
 const waveformLastSent = new Map();
 
 function onDataCallback(entry, channelInfo, samples, sampleRate, channelCode, unit) {
+  if (!entry.subscribers.size) return;
   const now = Date.now();
   const key = `${entry.station.code}_${channelCode}`;
   const lastSent = waveformLastSent.get(key) || 0;
@@ -374,10 +383,11 @@ function onDataCallback(entry, channelInfo, samples, sampleRate, channelCode, un
     downsampled.push(Math.round(samples[i] * 1e9) / 1e9);
   }
 
+  let payload;
   for (const clientId of entry.subscribers) {
     const client = clients.get(clientId);
     if (client && client.ws.readyState === client.ws.OPEN) {
-      client.ws.send(JSON.stringify({
+      payload ??= JSON.stringify({
         type: 'waveform',
         timestamp: new Date().toISOString(),
         samples: downsampled,
@@ -387,13 +397,14 @@ function onDataCallback(entry, channelInfo, samples, sampleRate, channelCode, un
         unit,  // 'm/s' o 'counts'
         station: entry.station.code,
         stationName: entry.station.name,
-      }));
+      });
+      client.ws.send(payload);
     }
   }
 }
 
 // === Callback de deteccion: recibe segmento filtrado en m/s ===
-function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channelCode) {
+function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channelCode, physicalSegment) {
   const detector = entry.detectors[channelCode];
   if (!detector || !filteredSegment || !filteredSegment.y) return;
 
@@ -418,6 +429,7 @@ function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channe
         lon: station.lon,
         sampleRate,
         channel: channelCode,
+        location: station.location,
       };
 
       const event = registerPPick(pick);
@@ -442,7 +454,7 @@ function onAlertCallback(entry, channelInfo, filteredSegment, sampleRate, channe
     }
 
     // Si se detecto un pick S
-    if (result.type === 'S_DETECTED' && result.sPickTime) {
+    if (result?.type === 'S_DETECTED' && result.sPickTime) {
       registerSPick(station.code, result.sPickTime, result.amplitude);
       broadcastToSubscribers(entry, {
         type: 's_wave_detected',
@@ -464,12 +476,10 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
   if (!location || !Number.isFinite(location.residual) || location.residual > SEISMIC_CONFIG.location.maxResidual
     || Math.abs(location.latitude) > 90 || Math.abs(location.longitude) > 180) return;
 
-  // 2. Calcular magnitud ML
-  const picksWithVelocity = picks.map(p => ({
-    ...p,
-    peakVelocityMs: p.amplitude,  // amplitud del pick P (aproximacion)
-  }));
-  const magnitudeResult = calculateEventMagnitude(picksWithVelocity, location);
+  // Detection and magnitude availability are separate. Never resurrect legacy ML.
+  const eventId = `evt_${event.id}`;
+  const archiveTask = eventArchive.capture(eventId, picks, getRawPWindow);
+  const magnitudeResult = await calculateResponseMagnitude(picks, location, getRawPWindow);
 
   // 3. Construir alerta
   const alert = {
@@ -479,7 +489,13 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
     longitude: location?.longitude ?? null,
     depth: location?.depth ?? null,  // null: no se calcula
     magnitude: magnitudeResult?.magnitude ?? null,
-    magnitudeType: magnitudeResult?.magnitudeType || 'ML',
+    magnitudeType: magnitudeResult.magnitudeType,
+    preliminaryMagnitude: true,
+    magnitudeStatus: magnitudeResult.magnitudeStatus,
+    magnitudeReason: magnitudeResult.magnitudeReason ?? null,
+    magnitudeMethod: magnitudeResult.magnitudeMethod,
+    responseMeasurements: magnitudeResult.responseMeasurements ?? [],
+    magnitudeUncertainty: null,
     stationMagnitudes: magnitudeResult?.stationMagnitudes || [],
     stationsUsed: event.numStations,
     pWaveDetected: true,
@@ -489,7 +505,13 @@ async function handleConfirmedEvent(entry, event, broadcastFn) {
     residual: location?.residual ?? null,
   };
 
-  await publishEventToFirebase(alert, `evt_${event.id}`, picks);
+  await publishEventToFirebase(alert, eventId, picks);
+  // Never delay FCM delivery for waveform collection. update() cannot create an
+  // incomplete event or trigger the onDocumentCreated notification a second time.
+  void archiveTask.then(async metadata => {
+    console.log(`[ARCHIVE] ${eventId}: ${metadata.status} ${metadata.reason || metadata.file || ''}`);
+    if (firebaseDb) await firebaseDb.collection('events').doc(eventId).update({ waveformArchive: metadata });
+  }).catch(error => console.warn(`[ARCHIVE] Metadata update failed for ${eventId}: ${error.message}`));
 
   // 4. Enviar a cada usuario con su tiempo estimado de llegada S
   for (const client of clients.values()) {
@@ -696,17 +718,6 @@ async function handleSimulatedEvent(event, epicenterLat, epicenterLon, mag, targ
   // Localizar epicentro (deberia aproximarse al lat/lon simulado)
   const location = locateEpicenter(event.picks);
 
-  // Calcular magnitud ML
-  const picksWithVelocity = event.picks.map((p) => ({
-    ...p,
-    peakVelocityMs: p.amplitude,
-  }));
-  const magnitudeResult = calculateEventMagnitude(picksWithVelocity, location || {
-    latitude: epicenterLat,
-    longitude: epicenterLon,
-    depth: null,
-  });
-
   // Construir alerta
   const alert = {
     type: 'earthquake_early_warning',
@@ -714,9 +725,10 @@ async function handleSimulatedEvent(event, epicenterLat, epicenterLon, mag, targ
     latitude: location?.latitude ?? epicenterLat,
     longitude: location?.longitude ?? epicenterLon,
     depth: location?.depth ?? null,
-    magnitude: magnitudeResult?.magnitude ?? mag,
-    magnitudeType: magnitudeResult?.magnitudeType || 'ML',
-    stationMagnitudes: magnitudeResult?.stationMagnitudes || [],
+    magnitude: mag,
+    magnitudeType: 'simulation',
+    magnitudeStatus: 'simulated',
+    stationMagnitudes: [],
     stationsUsed: event.numStations,
     pWaveDetected: true,
     estimatedSArrivalSeconds: null,
